@@ -140,6 +140,56 @@ menu "ESP32 Web PLC"
             default 2
     endmenu
 
+    menu "Open User Communication (TCON / TSEND / TRCV)"
+        config PLC_OUC_RX_BUF
+            int "Receive buffer per connection (bytes)"
+            range 512 32768
+            default 4096
+            help
+                Bytes a TCP connection holds until TRCV takes them. When it
+                is full the PLC stops reading and TCP flow control holds the
+                partner back; nothing is lost. A TRCV with a fixed LEN waits
+                until all LEN bytes are here, so keep this at least as large
+                as the largest LEN (S7 allows up to 8192). Allocated only
+                while a connection is open (at most 8), next to a send buffer
+                as large as the largest TSEND message (at most 8192 bytes).
+
+        config PLC_OUC_TASK_PRIORITY
+            int "Network task priority"
+            range 1 21
+            default 6
+            help
+                The task that does the socket work (listen, connect, send,
+                receive) of the program's TCP connections, on core 0. Keep it
+                below the scan task priority.
+    endmenu
+
+    menu "Clock (RD_SYS_T / RD_LOC_T)"
+        config PLC_SNTP
+            bool "Set the clock from a time server (SNTP)"
+            default y
+            help
+                Once the PLC has joined a Wi-Fi network it fetches the time,
+                so RD_SYS_T / RD_LOC_T read the real date and time. Without
+                it the clock starts at 1970-01-01 at every power-up.
+
+        config PLC_SNTP_SERVER
+            string "Time server"
+            depends on PLC_SNTP
+            default "pool.ntp.org"
+
+        config PLC_TIMEZONE
+            string "Time zone for RD_LOC_T (POSIX TZ string)"
+            default "CET-1CEST,M3.5.0,M10.5.0/3"
+            help
+                Local time = UTC + this zone, daylight saving time included.
+                Examples: "UTC0", "GMT0BST,M3.5.0/1,M10.5.0" (UK),
+                "CET-1CEST,M3.5.0,M10.5.0/3" (Central Europe),
+                "EET-2EEST,M3.5.0/3,M10.5.0/4" (Finland, Greece),
+                "EST5EDT,M3.2.0,M11.1.0" (US Eastern),
+                "PST8PDT,M3.2.0,M11.1.0" (US Pacific).
+    endmenu
+
     menu "Status LED"
         choice PLC_STATUS_LED
             prompt "Status LED type"

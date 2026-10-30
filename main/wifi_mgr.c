@@ -8,11 +8,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -36,6 +38,29 @@ static volatile int s_ap_clients;
 static esp_ip4_addr_t s_ip;
 static esp_timer_handle_t s_retry_t, s_fallback_t, s_apoff_t;
 static int s_retry_ms = 1000;
+
+/* ---------------------------------------------------------- clock (RD_SYS_T / RD_LOC_T) */
+#if CONFIG_PLC_SNTP /* a disabled bool is absent from sdkconfig.h: test it with #if */
+/* lwIP's task (small stack): just say so, once (it re-syncs every hour) */
+static void on_time_sync(struct timeval *tv)
+{
+    static bool logged;
+    if (!logged) ESP_LOGI(TAG, "clock set from %s", CONFIG_PLC_SNTP_SERVER);
+    logged = true;
+}
+
+/* event loop task, once the station has an address: SNTP keeps the clock
+ * right from then on (lwIP retries / re-syncs by itself) */
+static void sntp_start_once(void)
+{
+    static bool started;
+    if (started) return;
+    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG(CONFIG_PLC_SNTP_SERVER);
+    cfg.sync_cb = on_time_sync;
+    if (esp_netif_sntp_init(&cfg) == ESP_OK) started = true;
+    else ESP_LOGW(TAG, "SNTP could not be started - the PLC clock stays unset");
+}
+#endif
 
 /* ---------------------------------------------------------- credentials */
 static void load_credentials(void)
@@ -201,6 +226,9 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         esp_timer_stop(s_fallback_t);
         ESP_LOGI(TAG, "connected to \"%s\" - open http://" IPSTR "  or  http://%s.local", s_ssid, IP2STR(&s_ip), s_host);
         if (s_ap_on && s_ap_clients == 0) arm(s_apoff_t, 10000);
+#if CONFIG_PLC_SNTP
+        sntp_start_once();
+#endif
     }
 }
 

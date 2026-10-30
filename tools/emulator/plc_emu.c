@@ -1,10 +1,23 @@
 /* ctypes shim around the portable PLC core, used by tools/plc_emulator.py to
  * run the very same engine the ESP32 runs, on a PC. Strings returned by the
- * emu_*json functions are malloc'd: release them with emu_free_str(). */
+ * emu_*json functions are malloc'd: release them with emu_free_str().
+ *
+ * TCON / TSEND / TRCV get real TCP through main/ouc_net.c: one set of
+ * connection slots for the process, its sockets served at the start of every
+ * emu_cycle (and right after a STOP / unload, to close them). The Python side
+ * calls everything here under its runtime lock, so no further locking. */
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <sys/time.h>
+#endif
 
 #include "jw.h"
+#include "ouc_net.h"
 #include "plc_engine.h"
 
 #ifdef _WIN32
@@ -20,6 +33,48 @@ static double now_ms(void *u)
     return s_now;
 }
 
+/* days since 1970-01-01 of a Gregorian date (timegm() is not portable) */
+static long long days_from_civil(long long y, int m, int d)
+{
+    y -= m <= 2;
+    long long era = (y >= 0 ? y : y - 399) / 400, yoe = y - era * 400;
+    long long doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    return era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+}
+
+/* RD_SYS_T / RD_LOC_T: the PC's clock in ms since 1970, UTC or local wall time */
+static double wall_ms(void *u, bool local)
+{
+    (void)u;
+#ifdef _WIN32
+    FILETIME ft; /* 100 ns since 1601 */
+    GetSystemTimeAsFileTime(&ft);
+    double ms = (double)(((unsigned long long)ft.dwHighDateTime << 32 | ft.dwLowDateTime) / 10000ULL) - 11644473600000.0;
+#else
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    double ms = (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
+#endif
+    if (!local) return ms;
+    time_t t = (time_t)(ms / 1000.0);
+    struct tm *lt = localtime(&t); /* (calls are serialised by the Python lock) */
+    if (!lt) return ms;
+    long long sec = days_from_civil(lt->tm_year + 1900LL, lt->tm_mon + 1, lt->tm_mday) * 86400 + lt->tm_hour * 3600 +
+                    lt->tm_min * 60 + lt->tm_sec;
+    return (double)sec * 1000.0 + (ms - (double)t * 1000.0);
+}
+
+static ouc_net_t *s_ouc;
+static const plc_net_t *net(void)
+{
+    if (!s_ouc) s_ouc = ouc_net_create(NULL);
+    return ouc_net_ops(s_ouc); /* NULL (no sockets): the engine's virtual network */
+}
+static void net_pass(void)
+{
+    if (s_ouc) ouc_net_poll(s_ouc, 0);
+}
+
 static char *finish(jw_t *w)
 {
     if (w->oom || !w->buf) {
@@ -31,11 +86,15 @@ static char *finish(jw_t *w)
 
 EXPORT void *emu_load(const char *json, int len, char *err, int errlen)
 {
-    plc_env_t env = {now_ms, NULL, NULL, NULL, NULL};
+    plc_env_t env = {now_ms, NULL, NULL, NULL, NULL, wall_ms, net()};
     return plc_load(json, (size_t)(len > 0 ? len : 0), &env, err, (size_t)errlen);
 }
 
-EXPORT void emu_free(void *p) { plc_free((plc_t *)p); }
+EXPORT void emu_free(void *p)
+{
+    plc_free((plc_t *)p); /* closes its connections ... */
+    net_pass();           /* ... and their sockets now */
+}
 EXPORT void emu_free_str(char *s) { free(s); }
 
 /* one cycle with mock I/O: every GPIO input reads as an unwired pin would —
@@ -44,6 +103,7 @@ EXPORT void emu_cycle(void *vp, double now)
 {
     plc_t *p = (plc_t *)vp;
     s_now = now;
+    net_pass(); /* accept / connect / recv / send, without waiting */
     for (size_t i = 0; i < plc_io_count(p); i++) {
         plc_io_t *io = plc_io(p, i);
         if (io->dir == PLC_IO_IN || io->dir == PLC_IO_AIN) plc_io_set_input(p, i, 0);
@@ -167,6 +227,31 @@ EXPORT char *emu_srs(void *vp)
         jw_obj_end(&w);
     }
     jw_arr_end(&w);
+    return finish(&w);
+}
+
+/* CPU STOP: drop the program's TCP connections (TCON again on RUN) */
+EXPORT void emu_comm_reset(void *p)
+{
+    plc_comm_reset((plc_t *)p);
+    net_pass();
+}
+
+/* the program's connections (engine view) */
+EXPORT char *emu_conns(void *p)
+{
+    jw_t w;
+    jw_init(&w, NULL);
+    plc_conns_json((plc_t *)p, &w);
+    return finish(&w);
+}
+
+/* the sockets behind them, with their actual partners */
+EXPORT char *emu_sockets(void)
+{
+    jw_t w;
+    jw_init(&w, NULL);
+    ouc_net_json(s_ouc, &w);
     return finish(&w);
 }
 

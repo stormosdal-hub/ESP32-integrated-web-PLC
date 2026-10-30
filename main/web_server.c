@@ -16,6 +16,7 @@
 #include "jdom.h"
 #include "jw.h"
 #include "modbus_tcp.h"
+#include "ouc_esp.h"
 #include "plc_engine.h"
 #include "plc_io_esp.h"
 #include "plc_runtime.h"
@@ -325,6 +326,25 @@ static esp_err_t api_modbus_map(httpd_req_t *req)
     return r;
 }
 
+/* the program's TCON connections (engine view) + the sockets behind them */
+static esp_err_t api_ouc(httpd_req_t *req)
+{
+    jw_t w;
+    jw_init(&w, NULL);
+    jw_obj(&w);
+    jw_kbool(&w, "ok", true);
+    jw_key(&w, "conns");
+    plc_rt_lock();
+    plc_conns_json(plc_rt_engine(), &w);
+    plc_rt_unlock();
+    jw_key(&w, "sockets");
+    ouc_esp_json(&w); /* its own mutex only */
+    jw_obj_end(&w);
+    esp_err_t r = send_json(req, &w, NULL);
+    jw_release(&w, NULL);
+    return r;
+}
+
 static esp_err_t api_pins(httpd_req_t *req)
 {
     jw_t w;
@@ -598,6 +618,7 @@ esp_err_t web_server_start(void)
         {"/api/tags", HTTP_GET, api_tags},
         {"/api/netinfo", HTTP_GET, api_netinfo},
         {"/api/modbus-map", HTTP_GET, api_modbus_map},
+        {"/api/ouc", HTTP_GET, api_ouc},
         {"/api/pins", HTTP_GET, api_pins},
         {"/api/program", HTTP_GET, api_program_get},
         {"/api/program", HTTP_POST, api_program_post},

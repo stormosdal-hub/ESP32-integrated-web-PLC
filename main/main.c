@@ -8,14 +8,17 @@
  *                                        │  scan task (core 1)
  *                                        └─> plc_io_esp (GPIO / PWM / ADC)
  *   SCADA  ──Modbus TCP──> modbus_tcp ──> same I/Q/M memory
+ *   TCP partners <──TCON/TSEND/TRCV──> ouc_esp (socket task) <── scan
  *
- * Boot: NVS -> storage -> runtime (stored program, auto RUN) -> Wi-Fi -> web.
+ * Boot: NVS -> storage -> OUC sockets -> runtime (stored program, auto RUN)
+ *       -> Wi-Fi -> web.
  * ==========================================================================*/
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "modbus_tcp.h"
 #include "nvs_flash.h"
+#include "ouc_esp.h"
 #include "plc_io_esp.h"
 #include "plc_runtime.h"
 #include "plc_store.h"
@@ -38,6 +41,8 @@ void app_main(void)
 
     plc_io_board_init(status_led_pin());
     if (plc_store_init() != ESP_OK) ESP_LOGE(TAG, "program storage unavailable - downloads will fail");
+    /* before the runtime: a program loaded at boot gets the TCP transport */
+    if (ouc_esp_init() != ESP_OK) ESP_LOGE(TAG, "Open User Communication unavailable (out of memory)");
     ESP_ERROR_CHECK(plc_rt_init());
     status_led_start();
 
