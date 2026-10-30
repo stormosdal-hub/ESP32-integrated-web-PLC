@@ -82,26 +82,36 @@ typedef struct sx sx_t;
 typedef struct {
     uint8_t k;        /* 0 field offset, 1 array index */
     uint8_t bit;
-    uint32_t off;
-    const ty_t *arr;
-    sx_t **idx;
+    union {
+        uint32_t off;
+        struct {
+            const ty_t *arr;
+            sx_t **idx;
+        };
+    };
 } plst_t;
 
+/* A place. Built in scratch memory while a statement compiles, then stored
+ * in the arena by pfix() with the leading constant offsets folded (off0). */
 typedef struct pl {
     uint8_t pk, base, is_const, variant, dyn, cbit;
     uint8_t per, sli, width;   /* slice: bits per element, index, base width */
-    const ty_t *ty;
-    cref_t cell;
-    uint8_t *ptr;              /* B_SELF / B_DB */
-    vref_t *ref;               /* B_REF */
+    uint8_t hasc, bit0;        /* folded constant prefix: present, its bit */
     uint16_t nst;
+    uint32_t off0;
+    const ty_t *ty;
+    union {
+        cref_t cell;           /* PK_CELL */
+        uint8_t *ptr;          /* B_SELF / B_DB */
+        vref_t *ref;           /* B_REF */
+        struct pl *sbase;      /* PK_SLICE */
+    };
     plst_t *st;
-    struct pl *sbase;
-    const fld_t *field;
+    const fld_t *field;        /* compile time */
 } pl_t;
 
 enum { X_K, X_KS, X_RD, X_RDS, X_NOT, X_BNOT, X_NEG, X_AND, X_OR, X_XOR, X_BIT, X_CMP, X_AR, X_CONV, X_FN,
-       X_CNT, X_RDT, X_CALL };
+       X_CNT, X_RDT, X_CALL, X_CHAIN };
 enum { O_ADD, O_SUB, O_MUL, O_DIV, O_MOD, O_POW, O_EQ, O_NE, O_LT, O_GT, O_LE, O_GE, O_BAND, O_BOR, O_BXOR };
 enum { M_NUM, M_FLT, M_INT };
 enum { F_ABS, F_SQRT, F_SQR, F_LN, F_LOG, F_EXP, F_SIN, F_COS, F_TAN, F_ASIN, F_ACOS, F_ATAN, F_TRUNC,
@@ -112,15 +122,16 @@ typedef struct scall scall_t;
 struct sx {
     uint8_t op, o, mode, flag;
     uint8_t fn;
+    uint16_t n;        /* string length / argument count */
     const ty_t *ty;
-    double v;
-    const char *s;     /* string constant (Latin-1, may hold NUL) */
-    uint16_t sl;
     sx_t *a, *b;
-    sx_t **args;
-    uint16_t nargs;
-    pl_t *p;
-    scall_t *call;
+    union {
+        double v;
+        const char *s; /* string constant (Latin-1, may hold NUL) */
+        sx_t **args;
+        pl_t *p;
+        scall_t *call;
+    };
 };
 
 enum { BM_IN, BM_INOUT, BM_INS, BM_INCOPY, BM_INOUTCOPY, BM_REF, BM_OUT, BM_OUTCOPY };
@@ -156,14 +167,22 @@ typedef struct {
 } sarm_t;
 struct scl_stmt {
     uint8_t s;
-    pl_t *p, *src;
-    sx_t *e, *from, *to, *by;
-    uint32_t size;
-    scall_t *call;
-    sarm_t *arms;
     uint16_t narms;
-    ss_t *els, *body;
+    uint32_t size;
     ss_t *next;
+    pl_t *p;                   /* set / sets / copy / for */
+    sx_t *e;                   /* set / sets / case / while / repeat */
+    union {
+        pl_t *src;             /* copy */
+        ss_t *body;            /* for / while / repeat / block */
+        scall_t *call;         /* call */
+        sarm_t *arms;          /* if / case */
+    };
+    union {
+        ss_t *els;             /* if / case */
+        sx_t *from;            /* for */
+    };
+    sx_t *to, *by;             /* for */
 };
 
 /* ======================================================= compile context */
@@ -175,18 +194,26 @@ typedef struct pchunk {
 #define MAX_EXPR_DEPTH 32
 #define MAX_STMT_DEPTH 24
 
+#define TRING 256       /* tokens kept: the parser looks ahead at most ~200 (CASE labels) */
+#define LOOKAHEAD 200
+
 typedef struct {
     plc_t *p;            /* NULL: syntax only */
     unit_t *u;
     const ty_t *t;       /* instance type */
-    char fcret[160];     /* FC name (lowercase) when it has a RET_VAL, else "" */
+    char fcret[160];     /* FC name when it has a RET_VAL, else "" */
     const char *src;
-    tok_t *toks;
-    size_t ntok, ctok, pos;
-    pchunk_t *scratch;
+    size_t si, slen;     /* tokenizer position */
+    int sline, scol;
+    tok_t ring[TRING];   /* tokens [produced - TRING, produced) */
+    size_t produced, pos;
+    pchunk_t *scratch;   /* AST + places of the statement being compiled (released per statement) */
+    pchunk_t *strs;      /* token text, kept until the end */
+    struct itab *it;     /* interned IR nodes (identical constants / places / reads share one) */
     char *err;
     size_t errlen;
     int edepth, sdepth;
+    plc_t *sp;           /* stack guard (plc_stack_low), NULL: unchecked */
     uint16_t ncalls;
     jmp_buf jb;
 } cx_t;
@@ -202,29 +229,145 @@ static void fail_at(cx_t *cx, int line, const char *fmt, ...)
     longjmp(cx->jb, 1);
 }
 
-static void *sa(cx_t *cx, size_t n)
+#define CHUNK 4096
+static void *chunk_new(cx_t *cx, size_t bytes)
+{
+    void *(*al)(size_t) = cx->p ? (cx->p->env.alloc_big ? cx->p->env.alloc_big : cx->p->env.alloc) : NULL;
+    return al ? al(bytes) : malloc(bytes);
+}
+static void chunk_free(cx_t *cx, void *x)
+{
+    void (*fr)(void *) = cx->p ? cx->p->env.free : NULL;
+    if (fr) fr(x);
+    else free(x);
+}
+static void *bump(cx_t *cx, pchunk_t **list, size_t n)
 {
     n = (n + 7) & ~(size_t)7;
     size_t hdr = (sizeof(pchunk_t) + 7) & ~(size_t)7;
-    pchunk_t *c = cx->scratch;
+    pchunk_t *c = *list;
     if (!c || c->used + n > c->cap) {
-        size_t cap = n > 8192 ? n : 8192;
-        c = (pchunk_t *)malloc(hdr + cap);
+        size_t cap = n > CHUNK ? n : CHUNK;
+        c = (pchunk_t *)chunk_new(cx, hdr + cap);
         if (!c) fail_at(cx, 0, "out of memory");
-        c->next = cx->scratch;
+        c->next = *list;
         c->used = 0;
         c->cap = cap;
-        cx->scratch = c;
+        *list = c;
     }
     void *r = (uint8_t *)c + hdr + c->used;
     c->used += n;
     memset(r, 0, n);
     return r;
 }
+static void *sa(cx_t *cx, size_t n) { return bump(cx, &cx->scratch, n); }
+typedef struct {
+    pchunk_t *c;
+    size_t used;
+} smark_t;
+static smark_t sa_mark(cx_t *cx)
+{
+    smark_t m = {cx->scratch, cx->scratch ? cx->scratch->used : 0};
+    return m;
+}
+static void sa_release(cx_t *cx, smark_t m)
+{
+    while (cx->scratch && cx->scratch != m.c) {
+        pchunk_t *n = cx->scratch->next;
+        chunk_free(cx, cx->scratch);
+        cx->scratch = n;
+    }
+    if (cx->scratch) cx->scratch->used = m.used;
+}
 static void *aa(cx_t *cx, size_t n) { return plc_ar_alloc(cx->p, n); }
+
+/* ---- interning: an IR node is immutable once built, so identical ones can
+ * be shared — a block reads the same #i or 0 hundreds of times. The table
+ * keeps a hash per entry and compares against the node itself. ---- */
+enum { IK_K = 1, IK_PL, IK_RD };
+typedef struct {
+    uint32_t h;
+    uint8_t kind;
+    void *val;
+} ient_t;
+typedef struct itab {
+    ient_t *e;
+    size_t n, cap;
+} itab_t;
+#define ITAB_MAX 4096
+static uint32_t ihash(const uint64_t *k)
+{
+    uint64_t h = (k[0] * 0x9E3779B97F4A7C15ull) ^ (k[1] * 0xC2B2AE3D27D4EB4Full) ^ (k[2] + (k[3] << 7)) ^ (k[3] >> 17);
+    return (uint32_t)(h ^ (h >> 32));
+}
+static bool ieq_node(uint8_t kind, const void *val, const uint64_t *k)
+{
+    if (kind == IK_K) {
+        const sx_t *x = (const sx_t *)val;
+        return (uint64_t)(uintptr_t)x->ty == k[2] && !memcmp(&x->v, &k[1], 8);
+    }
+    if (kind == IK_RD) {
+        const sx_t *x = (const sx_t *)val;
+        return (uint64_t)(uintptr_t)x->p == k[1] && (uint64_t)(uintptr_t)x->ty == k[2];
+    }
+    const pl_t *r = (const pl_t *)val;
+    uint64_t base = 0;
+    if (r->pk == PK_CELL) memcpy(&base, &r->cell, sizeof(cref_t) < 8 ? sizeof(cref_t) : 8);
+    else base = r->base == B_REF ? (uint64_t)(uintptr_t)r->ref : (uint64_t)(uintptr_t)r->ptr;
+    uint64_t w3 = ((uint64_t)r->off0 << 24) | ((uint64_t)r->bit0 << 16) | ((uint64_t)r->hasc << 15) | ((uint64_t)r->pk << 12) |
+                  ((uint64_t)r->base << 8) | ((uint64_t)r->cbit << 4) | ((uint64_t)r->variant << 2) | (r->is_const ? 1u : 0u);
+    return base == k[1] && (uint64_t)(uintptr_t)r->ty == k[2] && w3 == k[3] && r->nst == 0;
+}
+static void *intern_get(cx_t *cx, const uint64_t *k)
+{
+    itab_t *t = cx->it;
+    if (!t || !t->cap) return NULL;
+    uint32_t h = ihash(k);
+    for (size_t i = h & (t->cap - 1);; i = (i + 1) & (t->cap - 1)) {
+        if (!t->e[i].val) return NULL;
+        if (t->e[i].h == h && t->e[i].kind == (uint8_t)k[0] && ieq_node(t->e[i].kind, t->e[i].val, k)) return t->e[i].val;
+    }
+}
+static void intern_put(cx_t *cx, const uint64_t *k, void *v)
+{
+    if (!cx->it) {
+        cx->it = (itab_t *)calloc(1, sizeof(itab_t));
+        if (!cx->it) return;
+    }
+    itab_t *t = cx->it;
+    if ((t->n + 1) * 2 > t->cap) {
+        if (t->cap >= ITAB_MAX) return; /* full: later nodes are not shared (still correct) */
+        size_t nc = t->cap ? t->cap * 2 : 256;
+        ient_t *ne = (ient_t *)calloc(nc, sizeof(ient_t));
+        if (!ne) return;
+        for (size_t i = 0; i < t->cap; i++) {
+            if (!t->e[i].val) continue;
+            size_t j = t->e[i].h & (nc - 1);
+            while (ne[j].val) j = (j + 1) & (nc - 1);
+            ne[j] = t->e[i];
+        }
+        free(t->e);
+        t->e = ne;
+        t->cap = nc;
+    }
+    uint32_t h = ihash(k);
+    size_t i = h & (t->cap - 1);
+    while (t->e[i].val) i = (i + 1) & (t->cap - 1);
+    t->e[i].h = h;
+    t->e[i].kind = (uint8_t)k[0];
+    t->e[i].val = v;
+    t->n++;
+}
+static void intern_free(cx_t *cx)
+{
+    if (!cx->it) return;
+    free(cx->it->e);
+    free(cx->it);
+    cx->it = NULL;
+}
 static char *sdup(cx_t *cx, const char *s, size_t n)
 {
-    char *r = (char *)sa(cx, n + 1);
+    char *r = (char *)bump(cx, &cx->strs, n + 1);
     memcpy(r, s, n);
     r[n] = 0;
     return r;
@@ -235,28 +378,23 @@ static bool is_a(char c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z
 static bool is_d(char c) { return c >= '0' && c <= '9'; }
 static bool is_an(char c) { return is_a(c) || is_d(c); }
 static char upc(char c) { return (c >= 'a' && c <= 'z') ? (char)(c - 32) : c; }
-static char lwc(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
 static bool is_hex(char c) { return is_d(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
 
 static tok_t *push_tok(cx_t *cx)
 {
-    if (cx->ntok + 1 > cx->ctok) {
-        size_t nc = cx->ctok ? cx->ctok * 2 : 128;
-        tok_t *nt = (tok_t *)realloc(cx->toks, nc * sizeof(tok_t));
-        if (!nt) fail_at(cx, 0, "out of memory");
-        cx->toks = nt;
-        cx->ctok = nc;
-    }
-    tok_t *t = &cx->toks[cx->ntok++];
+    tok_t *t = &cx->ring[cx->produced % TRING];
     memset(t, 0, sizeof *t);
+    cx->produced++;
     return t;
 }
 
-static void tokenize(cx_t *cx)
+/* scan the next token into the ring (EOF again and again at the end) */
+static void produce(cx_t *cx)
 {
     const char *s = cx->src;
-    size_t i = 0, n = strlen(s);
-    int line = 1, col = 1;
+    size_t i = cx->si, n = cx->slen;
+    int line = cx->sline, col = cx->scol;
+    size_t start = cx->produced;
 #define ADV(k)                                         \
     do {                                               \
         size_t _k = (size_t)(k);                       \
@@ -267,6 +405,7 @@ static void tokenize(cx_t *cx)
         }                                              \
     } while (0)
     while (i < n) {
+        if (cx->produced != start) break;
         char c = s[i];
         if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
             ADV(1);
@@ -568,17 +707,25 @@ static void tokenize(cx_t *cx)
         if ((unsigned char)c >= 0x80) fail_at(cx, line, "Unexpected character (non-ASCII)");
         fail_at(cx, line, "Unexpected character \"%c\"", c);
     }
-    tok_t *t = push_tok(cx);
-    t->t = T_EOF, t->line = line, t->col = col;
+    if (cx->produced == start) {
+        tok_t *t = push_tok(cx);
+        t->t = T_EOF, t->line = line, t->col = col;
+    }
+    cx->si = i, cx->sline = line, cx->scol = col;
 #undef ADV
 }
 
 /* ================================================================ parser */
-static tok_t *peek(cx_t *cx) { return &cx->toks[cx->pos]; }
-static tok_t *peek_at(cx_t *cx, size_t k) { return &cx->toks[cx->pos + k < cx->ntok ? cx->pos + k : cx->ntok - 1]; }
+static tok_t *tok_at(cx_t *cx, size_t k)
+{
+    while (cx->produced <= k) produce(cx);
+    return &cx->ring[k % TRING];
+}
+static tok_t *peek(cx_t *cx) { return tok_at(cx, cx->pos); }
+static tok_t *peek_at(cx_t *cx, size_t k) { return tok_at(cx, cx->pos + k); }
 static tok_t *nxt(cx_t *cx)
 {
-    tok_t *t = &cx->toks[cx->pos];
+    tok_t *t = tok_at(cx, cx->pos);
     if (t->t != T_EOF) cx->pos++;
     return t;
 }
@@ -673,7 +820,6 @@ static void p_stmts(cx_t *cx, stop_fn stop, an_t ***out, uint16_t *n)
     *out = l.v;
     *n = l.n;
 }
-static bool stop_eof(cx_t *cx) { return peek(cx)->t == T_EOF; }
 static bool stop_if(cx_t *cx) { return is_kw(cx, KW_ELSIF) || is_kw(cx, KW_ELSE) || is_kw(cx, KW_END_IF); }
 static bool stop_endif(cx_t *cx) { return is_kw(cx, KW_END_IF); }
 static bool stop_endfor(cx_t *cx) { return is_kw(cx, KW_END_FOR); }
@@ -684,16 +830,17 @@ static bool stop_endcase(cx_t *cx) { return is_kw(cx, KW_END_CASE); }
 
 static int label_len(cx_t *cx, size_t q)
 {
-    tok_t *t = &cx->toks[q < cx->ntok ? q : cx->ntok - 1];
-    if (t->t == T_OP && !strcmp(t->op, "-")) return (q + 1 < cx->ntok && cx->toks[q + 1].t == T_NUM) ? 2 : 0;
+    tok_t *t = tok_at(cx, q);
+    if (t->t == T_OP && !strcmp(t->op, "-")) return tok_at(cx, q + 1)->t == T_NUM ? 2 : 0;
     if (t->t == T_NUM || t->t == T_LID) return 1;
     return 0;
 }
 static bool tok_is_op(cx_t *cx, size_t q, const char *v)
 {
-    if (q >= cx->ntok) return false;
-    return cx->toks[q].t == T_OP && !strcmp(cx->toks[q].op, v);
+    tok_t *t = tok_at(cx, q);
+    return t->t == T_OP && !strcmp(t->op, v);
 }
+/* a new CASE arm starts here: <labels> ':' (looks at most LOOKAHEAD tokens ahead, like scl.js) */
 static bool stop_case(cx_t *cx)
 {
     if (is_kw(cx, KW_END_CASE) || is_kw(cx, KW_ELSE)) return true;
@@ -703,6 +850,7 @@ static bool stop_case(cx_t *cx)
             if (!tok_is_op(cx, q, ",")) break;
             q++;
         }
+        if (q - cx->pos > LOOKAHEAD) return false;
         int a = label_len(cx, q);
         if (!a) return false;
         q += (size_t)a;
@@ -738,7 +886,8 @@ static void case_value(cx_t *cx, double *v, const char **c)
 
 static an_t *p_stmt1(cx_t *cx)
 {
-    tok_t *t = peek(cx);
+    tok_t t0 = *peek(cx); /* a copy: the ring moves on while the statement parses */
+    tok_t *t = &t0;
     if (t->t == T_KW) {
         switch (t->kw) {
         case KW_IF: {
@@ -880,6 +1029,7 @@ static an_t *p_stmt1(cx_t *cx)
 static an_t *p_stmt(cx_t *cx)
 {
     if (++cx->sdepth > MAX_STMT_DEPTH) perr(cx, "Statements nested too deeply");
+    if (cx->sp && plc_stack_low(cx->sp)) perr(cx, "Statements " PLC_STACK_MSG);
     an_t *r = p_stmt1(cx);
     cx->sdepth--;
     return r;
@@ -893,87 +1043,56 @@ static an_t *bin(cx_t *cx, const char *op, an_t *a, an_t *b, const tok_t *t)
     x->b = b;
     return x;
 }
-static an_t *p_or(cx_t *cx);
+static an_t *p_binary(cx_t *cx, int minp);
 static an_t *p_expr(cx_t *cx)
 {
     if (++cx->edepth > MAX_EXPR_DEPTH) perr(cx, "Expression nested too deeply");
-    an_t *r = p_or(cx);
+    if (cx->sp && plc_stack_low(cx->sp)) perr(cx, "Expression " PLC_STACK_MSG);
+    an_t *r = p_binary(cx, 1);
     cx->edepth--;
     return r;
 }
-static an_t *p_xor(cx_t *cx);
-static an_t *p_and(cx_t *cx);
-static an_t *p_eq(cx_t *cx);
-static an_t *p_rel(cx_t *cx);
-static an_t *p_add(cx_t *cx);
-static an_t *p_mul(cx_t *cx);
 static an_t *p_unary(cx_t *cx);
-static an_t *p_or(cx_t *cx)
+/* precedence of the binary operator at the cursor (0: none):
+ * OR 1, XOR 2, AND & 3, = <> 4, < > <= >= 5, + - 6, * / MOD 7 — the same
+ * left-associative grammar as scl.js's parseOr..parseMul chain, in fewer
+ * stack frames (precedence climbing) */
+static int bin_prec(cx_t *cx, const char **op)
 {
-    an_t *a = p_xor(cx);
-    while (is_kw(cx, KW_OR)) {
-        tok_t t = *nxt(cx);
-        a = bin(cx, "OR", a, p_xor(cx), &t);
+    tok_t *t = peek(cx);
+    if (t->t == T_KW) {
+        if (t->kw == KW_OR) return *op = "OR", 1;
+        if (t->kw == KW_XOR) return *op = "XOR", 2;
+        if (t->kw == KW_AND) return *op = "AND", 3;
+        if (t->kw == KW_MOD) return *op = "MOD", 7;
+        return 0;
     }
-    return a;
+    if (t->t != T_OP) return 0;
+    if (!strcmp(t->op, "&")) return *op = "AND", 3;
+    if (!strcmp(t->op, "=") || !strcmp(t->op, "<>")) return *op = t->op, 4;
+    if (!strcmp(t->op, "<") || !strcmp(t->op, ">") || !strcmp(t->op, "<=") || !strcmp(t->op, ">=")) return *op = t->op, 5;
+    if (!strcmp(t->op, "+") || !strcmp(t->op, "-")) return *op = t->op, 6;
+    if (!strcmp(t->op, "*") || !strcmp(t->op, "/")) return *op = t->op, 7;
+    return 0;
 }
-static an_t *p_xor(cx_t *cx)
-{
-    an_t *a = p_and(cx);
-    while (is_kw(cx, KW_XOR)) {
-        tok_t t = *nxt(cx);
-        a = bin(cx, "XOR", a, p_and(cx), &t);
-    }
-    return a;
-}
-static an_t *p_and(cx_t *cx)
-{
-    an_t *a = p_eq(cx);
-    while (is_kw(cx, KW_AND) || is_op(cx, "&")) {
-        tok_t t = *nxt(cx);
-        a = bin(cx, "AND", a, p_eq(cx), &t);
-    }
-    return a;
-}
-static an_t *p_eq(cx_t *cx)
-{
-    an_t *a = p_rel(cx);
-    while (is_op(cx, "=") || is_op(cx, "<>")) {
-        tok_t t = *nxt(cx);
-        a = bin(cx, t.op, a, p_rel(cx), &t);
-    }
-    return a;
-}
-static an_t *p_rel(cx_t *cx)
-{
-    an_t *a = p_add(cx);
-    while (is_op(cx, "<") || is_op(cx, ">") || is_op(cx, "<=") || is_op(cx, ">=")) {
-        tok_t t = *nxt(cx);
-        a = bin(cx, t.op, a, p_add(cx), &t);
-    }
-    return a;
-}
-static an_t *p_add(cx_t *cx)
-{
-    an_t *a = p_mul(cx);
-    while (is_op(cx, "+") || is_op(cx, "-")) {
-        tok_t t = *nxt(cx);
-        a = bin(cx, t.op, a, p_mul(cx), &t);
-    }
-    return a;
-}
-static an_t *p_mul(cx_t *cx)
+static an_t *p_binary(cx_t *cx, int minp)
 {
     an_t *a = p_unary(cx);
-    while (is_op(cx, "*") || is_op(cx, "/") || is_kw(cx, KW_MOD)) {
+    for (;;) {
+        const char *op = NULL;
+        int pr = bin_prec(cx, &op);
+        if (!pr || pr < minp) return a;
+        char o[4];
+        snprintf(o, sizeof o, "%s", op);
         tok_t t = *nxt(cx);
-        a = bin(cx, t.t == T_KW ? "MOD" : t.op, a, p_unary(cx), &t);
+        an_t *b = pr < 7 ? p_binary(cx, pr + 1) : p_unary(cx);
+        a = bin(cx, o, a, b, &t);
     }
-    return a;
 }
 static an_t *p_unary_operand(cx_t *cx)
 {
     if (++cx->edepth > MAX_EXPR_DEPTH) perr(cx, "Expression nested too deeply");
+    if (cx->sp && plc_stack_low(cx->sp)) perr(cx, "Expression " PLC_STACK_MSG);
     an_t *r = p_unary(cx);
     cx->edepth--;
     return r;
@@ -1131,7 +1250,15 @@ static bool is_intlike(const ty_t *t)
                              t->cls == TC_CHAR);
 }
 static bool is_value(const ty_t *t) { return t->k == TK_EL || t->k == TK_STRV; }
-static const char *tn(const ty_t *t, char *b) { return ty_name(t, b, 96); }
+/* type name for an error message: four rotating static buffers (compiles run
+ * one at a time), so recursive compile frames carry no name buffers */
+static const char *tn(const ty_t *t)
+{
+    static char bufs[4][96];
+    static unsigned k;
+    char *b = bufs[k++ & 3];
+    return ty_name(t, b, 96);
+}
 
 static const ty_t *int_result(const ty_t *a, const ty_t *b)
 {
@@ -1165,8 +1292,13 @@ static sx_t *X(cx_t *cx, uint8_t op, const ty_t *ty)
 }
 static sx_t *K(cx_t *cx, double v, const ty_t *ty)
 {
-    sx_t *x = X(cx, X_K, ty);
+    uint64_t k[4] = {IK_K, 0, (uint64_t)(uintptr_t)ty, 0};
+    memcpy(&k[1], &v, 8);
+    sx_t *x = (sx_t *)intern_get(cx, k);
+    if (x) return x;
+    x = X(cx, X_K, ty);
     x->v = v;
+    intern_put(cx, k, x);
     return x;
 }
 
@@ -1182,12 +1314,59 @@ static sx_t *fold(cx_t *cx, sx_t *x)
 }
 
 /* ---- places ---- */
-static pl_t *pl_new(cx_t *cx) { return (pl_t *)aa(cx, sizeof(pl_t)); }
+static pl_t *pl_new(cx_t *cx) { return (pl_t *)sa(cx, sizeof(pl_t)); }
+/* store a finished place in the arena: the leading constant steps fold into off0 */
+static pl_t *pfix1(cx_t *cx, const pl_t *s);
+static pl_t *pfix(cx_t *cx, const pl_t *s)
+{
+    /* places without dynamic indices are shared */
+    bool cst = s->pk == PK_CELL || (s->pk == PK_LOC && !s->dyn);
+    uint64_t k[4] = {IK_PL, 0, (uint64_t)(uintptr_t)s->ty, 0};
+    if (cst) {
+        uint32_t off = 0;
+        uint8_t bit = 0, hasc = 0;
+        for (uint16_t i = 0; s->pk == PK_LOC && i < s->nst; i++) off += s->st[i].off, bit = s->st[i].bit, hasc = 1;
+        if (s->pk == PK_CELL) memcpy(&k[1], &s->cell, sizeof(cref_t) < 8 ? sizeof(cref_t) : 8);
+        else k[1] = s->base == B_REF ? (uint64_t)(uintptr_t)s->ref : (uint64_t)(uintptr_t)s->ptr;
+        k[3] = ((uint64_t)off << 24) | ((uint64_t)bit << 16) | ((uint64_t)hasc << 15) | ((uint64_t)s->pk << 12) |
+               ((uint64_t)s->base << 8) | ((uint64_t)s->cbit << 4) | ((uint64_t)s->variant << 2) | (s->is_const ? 1u : 0u);
+        pl_t *hit = (pl_t *)intern_get(cx, k);
+        if (hit) return hit;
+    }
+    pl_t *r = pfix1(cx, s);
+    if (cst) intern_put(cx, k, r);
+    return r;
+}
+static pl_t *pfix1(cx_t *cx, const pl_t *s)
+{
+    pl_t *r = (pl_t *)aa(cx, sizeof(pl_t));
+    *r = *s;
+    r->st = NULL;
+    r->nst = 0;
+    if (s->pk == PK_SLICE) {
+        r->sbase = pfix(cx, s->sbase);
+        return r;
+    }
+    if (s->pk != PK_LOC) return r;
+    uint16_t k = 0;
+    while (k < s->nst && s->st[k].k == 0) {
+        r->off0 += s->st[k].off;
+        r->bit0 = s->st[k].bit;
+        r->hasc = 1;
+        k++;
+    }
+    r->nst = (uint16_t)(s->nst - k);
+    if (r->nst) {
+        r->st = (plst_t *)aa(cx, sizeof(plst_t) * r->nst);
+        memcpy(r->st, s->st + k, sizeof(plst_t) * r->nst);
+    }
+    return r;
+}
 static pl_t *pl_copy(cx_t *cx, const pl_t *b, uint16_t extra)
 {
     pl_t *r = pl_new(cx);
     *r = *b;
-    r->st = (plst_t *)aa(cx, sizeof(plst_t) * (size_t)(b->nst + extra + 1));
+    r->st = (plst_t *)sa(cx, sizeof(plst_t) * (size_t)(b->nst + extra + 1));
     if (b->nst) memcpy(r->st, b->st, sizeof(plst_t) * b->nst);
     return r;
 }
@@ -1225,7 +1404,7 @@ static pl_t *self_field(cx_t *cx, const fld_t *f)
     }
     r->base = B_SELF;
     r->ptr = cx->u->mem.m->buf;
-    r->st = (plst_t *)aa(cx, sizeof(plst_t));
+    r->st = (plst_t *)sa(cx, sizeof(plst_t));
     r->st[0].k = 0;
     r->st[0].off = f->off;
     r->st[0].bit = f->bit;
@@ -1283,21 +1462,23 @@ static pl_t *cell_place(cx_t *cx, const char *raw)
     return r;
 }
 static pl_t *place_of(cx_t *cx, an_t *n);
-static pl_t *dotted_legacy(cx_t *cx, an_t *n)
+/* "Motor.Run" where Motor is no local, tag or DB: the old SCL's symbol */
+static void dotted_key(an_t *n, char *key, size_t cap, size_t *o)
+{
+    if (n->n == AN_MEM) {
+        dotted_key(n->a, key, cap, o);
+        if (*o < cap) *o += (size_t)snprintf(key + *o, cap - *o, ".%s", n->s);
+    } else if (*o < cap) *o += (size_t)snprintf(key + *o, cap - *o, "%s", n->s);
+}
+static __attribute__((noinline)) pl_t *dotted_legacy(cx_t *cx, an_t *n)
 {
     an_t *x = n;
-    int depth = 0;
-    while (x->n == AN_MEM) x = x->a, depth++;
+    while (x->n == AN_MEM) x = x->a;
     if (x->n != AN_NAME || x->local || x->quoted) return NULL;
     if (local_field(cx, x->s) || global_place(cx, x->s, x)) return NULL;
     char key[192];
-    size_t o = (size_t)snprintf(key, sizeof key, "%s", x->s);
-    /* names in source order */
-    an_t *chain[64];
-    int k = 0;
-    for (an_t *y = n; y->n == AN_MEM && k < 64; y = y->a) chain[k++] = y;
-    for (int i = k - 1; i >= 0 && o < sizeof key; i--) o += (size_t)snprintf(key + o, sizeof key - o, ".%s", chain[i]->s);
-    (void)depth;
+    size_t o = 0;
+    dotted_key(n, key, sizeof key, &o);
     return cell_place(cx, key);
 }
 static pl_t *name_place(cx_t *cx, an_t *n)
@@ -1332,7 +1513,6 @@ static pl_t *addr_place(cx_t *cx, an_t *n)
 static sx_t *expr_c(cx_t *cx, an_t *n);
 static pl_t *place_of(cx_t *cx, an_t *n)
 {
-    char b1[96];
     switch (n->n) {
     case AN_NAME: return name_place(cx, n);
     case AN_ADDR: return addr_place(cx, n);
@@ -1341,22 +1521,22 @@ static pl_t *place_of(cx_t *cx, an_t *n)
         if (lg) return lg;
         pl_t *b = place_of(cx, n->a);
         const ty_t *t = b->ty;
-        if (t->k != TK_STRUCT && t->k != TK_FB) CERR(n, "\"%s\": %s has no members", n->s, tn(t, b1));
+        if (t->k != TK_STRUCT && t->k != TK_FB) CERR(n, "\"%s\": %s has no members", n->s, tn(t));
         const fld_t *f = ty_field(t, n->s);
-        if (!f) CERR(n, "Unknown member \"%s\" in %s", n->s, tn(t, b1));
-        if (f->t->k == TK_VARIANT) CERR(n, "\"%s\" is a reference parameter of %s", n->s, tn(t, b1));
+        if (!f) CERR(n, "Unknown member \"%s\" in %s", n->s, tn(t));
+        if (f->t->k == TK_VARIANT) CERR(n, "\"%s\" is a reference parameter of %s", n->s, tn(t));
         return step_field(cx, b, f, n);
     }
     case AN_IDX: {
         pl_t *b = place_of(cx, n->a);
         const ty_t *t = b->ty;
-        if (t->k != TK_ARR) CERR(n, "Not an array: %s", tn(t, b1));
+        if (t->k != TK_ARR) CERR(n, "Not an array: %s", tn(t));
         if (n->nlist != t->ndim) CERR(n, "Array needs %d index(es)", t->ndim);
         sx_t **idx = (sx_t **)aa(cx, sizeof(sx_t *) * n->nlist);
         bool cst = true;
         for (uint16_t i = 0; i < n->nlist; i++) {
             idx[i] = expr_c(cx, n->list[i]);
-            if (!is_intlike(idx[i]->ty) && !is_num(idx[i]->ty)) CERR(n->list[i], "Array index must be an integer, not %s", tn(idx[i]->ty, b1));
+            if (!is_intlike(idx[i]->ty) && !is_num(idx[i]->ty)) CERR(n->list[i], "Array index must be an integer, not %s", tn(idx[i]->ty));
             if (idx[i]->op != X_K) cst = false;
         }
         if (b->pk != PK_LOC) CERR(n, "Cannot index this");
@@ -1388,10 +1568,10 @@ static pl_t *place_of(cx_t *cx, an_t *n)
     }
     case AN_SLICE: {
         pl_t *b = place_of(cx, n->a);
-        if (!(is_intlike(b->ty) || (b->pk == PK_CELL && is_num(b->ty)))) CERR(n, "Slices need a bit string or integer, not %s", tn(b->ty, b1));
+        if (!(is_intlike(b->ty) || (b->pk == PK_CELL && is_num(b->ty)))) CERR(n, "Slices need a bit string or integer, not %s", tn(b->ty));
         int width = b->ty->bits ? b->ty->bits : 32;
         int per = n->slk == 'X' ? 1 : n->slk == 'B' ? 8 : n->slk == 'W' ? 16 : 32;
-        if (per > width || n->sidx < 0 || (n->sidx + 1) * per > width) CERR(n, "Slice %%%c%d is outside %s", n->slk, n->sidx, tn(b->ty, b1));
+        if (per > width || n->sidx < 0 || (n->sidx + 1) * per > width) CERR(n, "Slice %%%c%d is outside %s", n->slk, n->sidx, tn(b->ty));
         pl_t *r = pl_new(cx);
         r->pk = PK_SLICE;
         r->sbase = b;
@@ -1410,9 +1590,10 @@ static pl_t *place_of(cx_t *cx, an_t *n)
 /* ---- expressions ---- */
 static sx_t *bin_c(cx_t *cx, an_t *n, an_t *na, an_t *nb, const char *op);
 static scall_t *call_c(cx_t *cx, an_t *n, bool as_expr, sx_t **special);
+static sx_t *bin_chain(cx_t *cx, an_t *n);
 static sx_t *expr_c(cx_t *cx, an_t *n)
 {
-    char b1[96];
+    if (plc_stack_low(cx->p)) CERR(n, "Expression " PLC_STACK_MSG);
     switch (n->n) {
     case AN_NUM:
         if (n->ty) return K(cx, n->ty->cls == TC_BOOL ? (n->v != 0) : n->ty->cls == TC_REAL ? n->v : ty_conv(n->v, n->ty), n->ty);
@@ -1421,12 +1602,12 @@ static sx_t *expr_c(cx_t *cx, an_t *n)
     case AN_STR: {
         sx_t *x = X(cx, X_KS, &TY_STRV);
         x->s = plc_ar_strdup(cx->p, n->s, n->sl);
-        x->sl = (uint16_t)n->sl;
+        x->n = (uint16_t)n->sl;
         return x;
     }
     case AN_UN: {
         sx_t *a = expr_c(cx, n->a);
-        if (!is_value(a->ty) || a->ty->k == TK_STRV) CERR(n, "Operator %s needs a value, not %s", n->op, tn(a->ty, b1));
+        if (!is_value(a->ty) || a->ty->k == TK_STRV) CERR(n, "Operator %s needs a value, not %s", n->op, tn(a->ty));
         if (!strcmp(n->op, "NOT")) {
             sx_t *x = X(cx, is_intlike(a->ty) ? X_BNOT : X_NOT, is_intlike(a->ty) ? a->ty : &TY_BOOL);
             x->a = a;
@@ -1436,7 +1617,7 @@ static sx_t *expr_c(cx_t *cx, an_t *n)
         x->a = a;
         return fold(cx, x);
     }
-    case AN_BIN: return bin_c(cx, n, n->a, n->b, n->op);
+    case AN_BIN: return bin_chain(cx, n);
     case AN_CALL: {
         sx_t *sp = NULL;
         scall_t *c = call_c(cx, n, true, &sp);
@@ -1449,12 +1630,17 @@ static sx_t *expr_c(cx_t *cx, an_t *n)
         pl_t *pl = place_of(cx, n);
         if (pl->ty->k == TK_STR) {
             sx_t *x = X(cx, X_RDS, &TY_STRV);
-            x->p = pl;
+            x->p = pfix(cx, pl);
             return x;
         }
-        if (pl->ty->k != TK_EL) CERR(n, "%s cannot be used as a value here", tn(pl->ty, b1));
-        sx_t *x = X(cx, X_RD, pl->ty);
-        x->p = pl;
+        if (pl->ty->k != TK_EL) CERR(n, "%s cannot be used as a value here", tn(pl->ty));
+        pl_t *fp = pfix(cx, pl);
+        uint64_t k[4] = {IK_RD, (uint64_t)(uintptr_t)fp, (uint64_t)(uintptr_t)pl->ty, 0};
+        sx_t *x = (sx_t *)intern_get(cx, k);
+        if (x) return x;
+        x = X(cx, X_RD, pl->ty);
+        x->p = fp;
+        intern_put(cx, k, x);
         return x;
     }
     }
@@ -1468,22 +1654,20 @@ static uint8_t op_code(const char *op)
 }
 static sx_t *bin_parts(cx_t *cx, an_t *n, sx_t *a, sx_t *b, const char *op)
 {
-    char b1[96];
-    if (!is_value(a->ty)) CERR(n, "Operator %s cannot take %s", op, tn(a->ty, b1));
-    if (!is_value(b->ty)) CERR(n, "Operator %s cannot take %s", op, tn(b->ty, b1));
+    if (!is_value(a->ty)) CERR(n, "Operator %s cannot take %s", op, tn(a->ty));
+    if (!is_value(b->ty)) CERR(n, "Operator %s cannot take %s", op, tn(b->ty));
     uint8_t o = op_code(op);
     if (o >= O_EQ && o <= O_GE) {
         bool sa_ = a->ty->k == TK_STRV, sb_ = b->ty->k == TK_STRV;
         if (sa_ != sb_) {
-            char b2[96];
-            CERR(n, "Cannot compare %s with %s", tn(a->ty, b1), tn(b->ty, b2));
+            CERR(n, "Cannot compare %s with %s", tn(a->ty), tn(b->ty));
         }
         sx_t *x = X(cx, X_CMP, &TY_BOOL);
         x->o = o, x->a = a, x->b = b, x->flag = sa_;
         return sa_ ? x : fold(cx, x);
     }
-    if (a->ty->k == TK_STRV) CERR(n, "Operator %s cannot take %s", op, tn(a->ty, b1));
-    if (b->ty->k == TK_STRV) CERR(n, "Operator %s cannot take %s", op, tn(b->ty, b1));
+    if (a->ty->k == TK_STRV) CERR(n, "Operator %s cannot take %s", op, tn(a->ty));
+    if (b->ty->k == TK_STRV) CERR(n, "Operator %s cannot take %s", op, tn(b->ty));
     if (o == O_BAND || o == O_BOR || o == O_BXOR) {
         if (is_intlike(a->ty) && is_intlike(b->ty)) {
             sx_t *x = X(cx, X_BIT, int_result(a->ty, b->ty));
@@ -1511,6 +1695,39 @@ static sx_t *bin_c(cx_t *cx, an_t *n, an_t *na, an_t *nb, const char *op)
     sx_t *a = expr_c(cx, na);
     sx_t *b = expr_c(cx, nb);
     return bin_parts(cx, n, a, b, op);
+}
+/* the binary operators the evaluator can run with the left operand given */
+static bool chainable(const sx_t *x)
+{
+    return x->op == X_AND || x->op == X_OR || x->op == X_XOR || x->op == X_BIT || x->op == X_AR ||
+           (x->op == X_CMP && !x->flag);
+}
+/* a + b + c + ... parses to a left-deep tree as deep as the chain is long.
+ * Its left spine is compiled in a loop (a scratch array, not the C stack),
+ * and a long spine becomes one X_CHAIN node that ev() also runs in a loop:
+ * x->a is the leftmost operand, x->args[0..n-1] the operators bottom-up. */
+#define CHAIN_MIN 8
+static sx_t *bin_chain(cx_t *cx, an_t *n)
+{
+    uint32_t k = 0;
+    an_t *m = n;
+    for (; m->n == AN_BIN; m = m->a) k++;
+    an_t **sp = (an_t **)sa(cx, k * sizeof *sp);
+    k = 0;
+    for (m = n; m->n == AN_BIN; m = m->a) sp[k++] = m;
+    sx_t *x = expr_c(cx, m);
+    while (k--) x = bin_parts(cx, sp[k], x, expr_c(cx, sp[k]->b), sp[k]->op);
+    k = 0;
+    sx_t *y = x;
+    for (; chainable(y); y = y->a) k++;
+    if (k < CHAIN_MIN) return x;
+    if (k > UINT16_MAX) CERR(n, "Expression too long");
+    sx_t *c = X(cx, X_CHAIN, x->ty);
+    c->a = y;
+    c->n = (uint16_t)k;
+    c->args = (sx_t **)aa(cx, k * sizeof(sx_t *));
+    for (y = x; chainable(y); y = y->a) c->args[--k] = y;
+    return c;
 }
 
 /* ---- calls ---- */
@@ -1643,18 +1860,17 @@ static sx_t *builtin_c(cx_t *cx, an_t *n, const bfn_t *B, const char *up)
     x = X(cx, X_FN, ty);
     x->fn = B->fn;
     x->args = a;
-    x->nargs = na;
+    x->n = na;
     return x;
 }
 static sx_t *special_c(cx_t *cx, an_t *n, const char *up)
 {
-    char b1[96];
     if (!strcmp(up, "COUNTOFELEMENTS")) {
         if (n->nlist != 1 || n->list[0]->out) CERR(n, "CountOfElements takes one array");
         pl_t *pl = arg_place(cx, n->list[0], "CountOfElements");
         if (pl->variant) {
             sx_t *x = X(cx, X_CNT, &TY_UDINT);
-            x->p = pl;
+            x->p = pfix(cx, pl);
             return x;
         }
         return K(cx, pl->ty->k == TK_ARR ? pl->ty->count : 0, &TY_UDINT);
@@ -1669,12 +1885,12 @@ static sx_t *special_c(cx_t *cx, an_t *n, const char *up)
         if (n->nlist != 1 || n->list[0]->out) CERR(n, "LEN takes one String");
         sx_t *a = expr_c(cx, n->list[0]->a);
         if (a->ty->k != TK_STRV) CERR(n, "LEN needs a String");
-        if (a->op == X_KS) return K(cx, a->sl, &TY_INT);
+        if (a->op == X_KS) return K(cx, a->n, &TY_INT);
         sx_t *x = X(cx, X_FN, &TY_INT);
         x->fn = F_LEN;
         x->args = (sx_t **)aa(cx, sizeof(sx_t *));
         x->args[0] = a;
-        x->nargs = 1;
+        x->n = 1;
         return x;
     }
     bool local = !strcmp(up, "RD_LOC_T");
@@ -1683,15 +1899,13 @@ static sx_t *special_c(cx_t *cx, an_t *n, const char *up)
     if (ar->s && !plc_ieq(ar->s, "OUT")) CERR(ar, "Unknown parameter %s", ar->s);
     pl_t *pl = arg_place(cx, ar, "OUT");
     if (!ty_same(cx->p, pl->ty, ty_builtin_struct(cx->p, "DTL"))) CERR(ar, "OUT must be a DTL");
-    (void)b1;
     sx_t *x = X(cx, X_RDT, &TY_INT);
-    x->p = pl;
+    x->p = pfix(cx, pl);
     x->flag = local;
     return x;
 }
 static bind_t bind_c(cx_t *cx, const fld_t *fp, uint16_t fi, an_t *ar)
 {
-    char b1[96], b2[96];
     bind_t b;
     memset(&b, 0, sizeof b);
     b.f = fp;
@@ -1699,16 +1913,16 @@ static bind_t bind_c(cx_t *cx, const fld_t *fp, uint16_t fi, an_t *ar)
     const ty_t *ft = fp->ref ? fp->reft : fp->t;
     if (fp->ref) {
         pl_t *pl = arg_place(cx, ar, fp->name);
-        if (ft->k != TK_VARIANT && !ty_same(cx->p, pl->ty, ft)) CERR(ar, "%s needs %s, not %s", fp->name, tn(ft, b1), tn(pl->ty, b2));
+        if (ft->k != TK_VARIANT && !ty_same(cx->p, pl->ty, ft)) CERR(ar, "%s needs %s, not %s", fp->name, tn(ft), tn(pl->ty));
         if (pl->pk == PK_SLICE) CERR(ar, "%s: a slice cannot be passed by reference", fp->name);
         b.mode = BM_REF;
-        b.p = pl;
+        b.p = pfix(cx, pl);
         return b;
     }
     if (fp->sec == SEC_IN) {
         if (ft->k == TK_EL) {
             sx_t *x = expr_c(cx, ar->a);
-            if (!is_value(x->ty) || x->ty->k == TK_STRV) CERR(ar, "%s needs %s, not %s", fp->name, tn(ft, b1), tn(x->ty, b2));
+            if (!is_value(x->ty) || x->ty->k == TK_STRV) CERR(ar, "%s needs %s, not %s", fp->name, tn(ft), tn(x->ty));
             b.mode = BM_IN;
             b.e = x;
             return b;
@@ -1721,22 +1935,22 @@ static bind_t bind_c(cx_t *cx, const fld_t *fp, uint16_t fi, an_t *ar)
             return b;
         }
         pl_t *pl = arg_place(cx, ar, fp->name);
-        if (!ty_same(cx->p, pl->ty, ft)) CERR(ar, "%s needs %s, not %s", fp->name, tn(ft, b1), tn(pl->ty, b2));
+        if (!ty_same(cx->p, pl->ty, ft)) CERR(ar, "%s needs %s, not %s", fp->name, tn(ft), tn(pl->ty));
         b.mode = BM_INCOPY;
-        b.p = pl;
+        b.p = pfix(cx, pl);
         return b;
     }
     pl_t *pl = arg_place(cx, ar, fp->name);
     if (pl->is_const) CERR(ar, "%s: cannot write to a constant", fp->name);
     if (ft->k == TK_EL) {
-        if (pl->ty->k != TK_EL) CERR(ar, "%s needs %s, not %s", fp->name, tn(ft, b1), tn(pl->ty, b2));
+        if (pl->ty->k != TK_EL) CERR(ar, "%s needs %s, not %s", fp->name, tn(ft), tn(pl->ty));
         b.mode = fp->sec == SEC_OUT ? BM_OUT : BM_INOUT;
-        b.p = pl;
+        b.p = pfix(cx, pl);
         return b;
     }
-    if (!ty_same(cx->p, pl->ty, ft)) CERR(ar, "%s needs %s, not %s", fp->name, tn(ft, b1), tn(pl->ty, b2));
+    if (!ty_same(cx->p, pl->ty, ft)) CERR(ar, "%s needs %s, not %s", fp->name, tn(ft), tn(pl->ty));
     b.mode = fp->sec == SEC_OUT ? BM_OUTCOPY : BM_INOUTCOPY;
-    b.p = pl;
+    b.p = pfix(cx, pl);
     return b;
 }
 /* the unit an SCL call runs: an FC frame, an FB multi-instance or instance DB */
@@ -1765,10 +1979,24 @@ static uint8_t *const_ptr(const pl_t *pl)
     for (uint16_t i = 0; i < pl->nst; i++) ptr += pl->st[i].off;
     return ptr;
 }
+/* an FC frame per call site: "<caller>/<call number>" */
+static __attribute__((noinline)) unit_t *fc_unit(cx_t *cx, blk_t *fc)
+{
+    char inst[256];
+    snprintf(inst, sizeof inst, "%s/%u", cx->u->inst, (unsigned)cx->ncalls);
+    return callee_unit(cx, fc, inst, NULL);
+}
+/* a multi-instance: "<caller>.<path>", its memory inside the caller's */
+static __attribute__((noinline)) unit_t *multi_unit(cx_t *cx, const pl_t *ip, an_t *target)
+{
+    char inst[256];
+    size_t o = (size_t)snprintf(inst, sizeof inst, "%s.", cx->u->inst);
+    canon_path(target, inst, sizeof inst, &o);
+    return callee_unit(cx, ip->ty->blk, inst, const_ptr(ip));
+}
 static scall_t *call_c(cx_t *cx, an_t *n, bool as_expr, sx_t **special)
 {
     plc_t *p = cx->p;
-    char b1[96];
     an_t *f = n->a;
     scall_t *c = (scall_t *)aa(cx, sizeof(scall_t));
     c->ty = &TY_VOID;
@@ -1784,9 +2012,7 @@ static scall_t *call_c(cx_t *cx, an_t *n, bool as_expr, sx_t **special)
         if (f->quoted || (bn && !B && !conv_dst(up) && !is_special(up))) {
             if (!bn) CERR(f, "Unknown block \"%s\"", f->s);
             if (bn->type == BT_FC) {
-                char inst[256];
-                snprintf(inst, sizeof inst, "%s/%u", cx->u->inst, (unsigned)cx->ncalls);
-                c->cu = callee_unit(cx, bn, inst, NULL);
+                c->cu = fc_unit(cx, bn);
                 c->is_fc = 1;
             } else if (bn->type == BT_DB && jd_get(p->doc, bn->json, "instanceOf") >= 0) {
                 char idb[160];
@@ -1834,19 +2060,16 @@ static scall_t *call_c(cx_t *cx, an_t *n, bool as_expr, sx_t **special)
             }
         }
         pl_t *ip = place_of(cx, target);
-        if (ip->ty->k != TK_FB) CERR(f, "Not a function block instance: %s", tn(ip->ty, b1));
+        if (ip->ty->k != TK_FB) CERR(f, "Not a function block instance: %s", tn(ip->ty));
         if (ip->pk != PK_LOC || ip->base == B_REF) CERR(f, "This FB instance cannot be called");
         if (ip->ty->sys) {
             c->sys = method ? plc_sysfb_type(p, method) : ip->ty;
-            c->inst = ip;
+            c->inst = pfix(cx, ip);
             it = c->sys;
             c->srefs = (vref_t *)aa(cx, sizeof(vref_t) * (it->nf + 1u));
         } else {
             if (ip->dyn) CERR(f, "Arrays of FB instances need a constant index");
-            char inst[256];
-            size_t o = (size_t)snprintf(inst, sizeof inst, "%s.", cx->u->inst);
-            canon_path(target, inst, sizeof inst, &o);
-            c->cu = callee_unit(cx, ip->ty->blk, inst, const_ptr(ip));
+            c->cu = multi_unit(cx, ip, target);
             if (!c->cu) CERR(f, "This FB instance cannot be called");
             it = c->cu->mem.t;
         }
@@ -1863,7 +2086,7 @@ static scall_t *call_c(cx_t *cx, an_t *n, bool as_expr, sx_t **special)
             continue;
         }
         if (ar->s && plc_ieq(ar->s, "ENO") && ar->out) {
-            c->eno = arg_place(cx, ar, "ENO");
+            c->eno = pfix(cx, arg_place(cx, ar, "ENO"));
             if (!is_bool(c->eno->ty)) CERR(ar, "ENO needs a Bool");
             continue;
         }
@@ -1945,7 +2168,7 @@ static double case_lab(cx_t *cx, double v, const char *c, an_t *n)
 }
 static ss_t *stmt_c(cx_t *cx, an_t *s)
 {
-    char b1[96], b2[96];
+    if (plc_stack_low(cx->p)) CERR(s, "Statements " PLC_STACK_MSG);
     ss_t *r = (ss_t *)aa(cx, sizeof(ss_t));
     switch (s->n) {
     case AN_ASSIGN: {
@@ -1955,29 +2178,29 @@ static ss_t *stmt_c(cx_t *cx, an_t *s)
             if (lhs->ty->k != TK_EL) CERR(s, "%s needs a number", s->op);
             char op[2] = {s->op[0], 0};
             r->s = S_SET;
-            r->p = lhs;
+            r->p = pfix(cx, lhs);
             r->e = bin_c(cx, s, s->a, s->b, op);
             return r;
         }
         if (lhs->ty->k == TK_EL) {
             sx_t *e = expr_c(cx, s->b);
-            if (!is_value(e->ty) || e->ty->k == TK_STRV) CERR(s, "Cannot assign %s to %s", tn(e->ty, b1), tn(lhs->ty, b2));
-            r->s = S_SET, r->p = lhs, r->e = e;
+            if (!is_value(e->ty) || e->ty->k == TK_STRV) CERR(s, "Cannot assign %s to %s", tn(e->ty), tn(lhs->ty));
+            r->s = S_SET, r->p = pfix(cx, lhs), r->e = e;
             return r;
         }
         if (lhs->ty->k == TK_STR) {
             sx_t *e = expr_c(cx, s->b);
-            if (e->ty->k != TK_STRV) CERR(s, "Cannot assign %s to a String", tn(e->ty, b1));
-            r->s = S_SETS, r->p = lhs, r->e = e;
+            if (e->ty->k != TK_STRV) CERR(s, "Cannot assign %s to a String", tn(e->ty));
+            r->s = S_SETS, r->p = pfix(cx, lhs), r->e = e;
             return r;
         }
         if (lhs->ty->k == TK_VARIANT) CERR(s, "Cannot assign to a Variant");
         an_t *rhs = s->b;
         if (rhs->n == AN_NUM || rhs->n == AN_BOOL || rhs->n == AN_STR || rhs->n == AN_BIN || rhs->n == AN_UN || rhs->n == AN_CALL)
-            CERR(s, "Cannot assign a value to %s", tn(lhs->ty, b1));
+            CERR(s, "Cannot assign a value to %s", tn(lhs->ty));
         pl_t *src = place_of(cx, rhs);
-        if (!ty_same(cx->p, src->ty, lhs->ty)) CERR(s, "Cannot assign %s to %s", tn(src->ty, b1), tn(lhs->ty, b2));
-        r->s = S_COPY, r->p = lhs, r->src = src, r->size = lhs->ty->size;
+        if (!ty_same(cx->p, src->ty, lhs->ty)) CERR(s, "Cannot assign %s to %s", tn(src->ty), tn(lhs->ty));
+        r->s = S_COPY, r->p = pfix(cx, lhs), r->src = pfix(cx, src), r->size = lhs->ty->size;
         return r;
     }
     case AN_CALLST: {
@@ -2029,7 +2252,7 @@ static ss_t *stmt_c(cx_t *cx, an_t *s)
     case AN_FOR: {
         pl_t *v = place_of(cx, s->a);
         if (!(is_intlike(v->ty) || is_num(v->ty))) CERR(s, "FOR needs an integer variable");
-        r->s = S_FOR, r->p = v;
+        r->s = S_FOR, r->p = pfix(cx, v);
         r->from = num_e(cx, s->b);
         r->to = num_e(cx, s->c);
         r->by = s->d ? num_e(cx, s->d) : NULL;
@@ -2078,6 +2301,7 @@ static bool loc_of(plc_t *p, const pl_t *pl, uint8_t **ptr, uint8_t *bit)
         b = pl->ref->ptr;
         bt = pl->ref->bit;
     } else b = pl->ptr;
+    if (pl->hasc) b += pl->off0, bt = pl->bit0;
     for (uint16_t i = 0; i < pl->nst; i++) {
         const plst_t *s = &pl->st[i];
         if (s->k == 0) {
@@ -2206,8 +2430,44 @@ static __attribute__((noinline)) double str_len(plc_t *p, sx_t *x)
 }
 static double eval_fn(plc_t *p, sx_t *x);
 
+/* a binary operator (chainable()) whose left operand evaluated to a */
+static inline double bin_ev(plc_t *p, sx_t *x, double a)
+{
+    switch (x->op) {
+    case X_AND: return tb(a) && tb(ev(p, x->b));
+    case X_OR: return tb(a) || tb(ev(p, x->b));
+    case X_XOR: return tb(a) != tb(ev(p, x->b));
+    case X_BIT: {
+        uint32_t ua = u32_of(a), ub = u32_of(ev(p, x->b));
+        uint32_t r = x->o == O_BAND ? (ua & ub) : x->o == O_BOR ? (ua | ub) : (ua ^ ub);
+        return x->ty->any ? (double)r : ty_wrap((double)r, x->ty->bits, x->ty->sign);
+    }
+    case X_CMP: {
+        double na = numx(a), nb = numx(ev(p, x->b));
+        switch (x->o) {
+        case O_EQ: return na == nb;
+        case O_NE: return na != nb;
+        case O_LT: return na < nb;
+        case O_GT: return na > nb;
+        case O_LE: return na <= nb;
+        case O_GE: return na >= nb;
+        }
+        return 0;
+    }
+    case X_AR: {
+        double na = numx(a), nb = numx(ev(p, x->b));
+        if (x->mode == M_INT) return wrap_to(int_op(x->o, na, nb), x->ty);
+        return flt_op(x->o, na, nb);
+    }
+    }
+    return 0;
+}
 static double ev(plc_t *p, sx_t *x)
 {
+    if (plc_stack_low(p)) {
+        plc_errorf(p, "Expression " PLC_STACK_MSG " - evaluated as 0");
+        return 0;
+    }
     switch (x->op) {
     case X_K: return x->v;
     case X_RD: return read_p(p, x->p);
@@ -2218,31 +2478,18 @@ static double ev(plc_t *p, sx_t *x)
         return ty_wrap(-v - 1, x->ty->bits, x->ty->sign);
     }
     case X_NEG: return wrap_to(-numx(ev(p, x->a)), x->ty);
-    case X_AND: return tb(ev(p, x->a)) && tb(ev(p, x->b));
-    case X_OR: return tb(ev(p, x->a)) || tb(ev(p, x->b));
-    case X_XOR: return tb(ev(p, x->a)) != tb(ev(p, x->b));
-    case X_BIT: {
-        uint32_t a = u32_of(ev(p, x->a)), b = u32_of(ev(p, x->b));
-        uint32_t r = x->o == O_BAND ? (a & b) : x->o == O_BOR ? (a | b) : (a ^ b);
-        return x->ty->any ? (double)r : ty_wrap((double)r, x->ty->bits, x->ty->sign);
-    }
-    case X_CMP: {
+    case X_AND:
+    case X_OR:
+    case X_XOR:
+    case X_BIT:
+    case X_AR: return bin_ev(p, x, ev(p, x->a));
+    case X_CMP:
         if (x->flag) return cmp_str(p, x);
-        double a = numx(ev(p, x->a)), b = numx(ev(p, x->b));
-        switch (x->o) {
-        case O_EQ: return a == b;
-        case O_NE: return a != b;
-        case O_LT: return a < b;
-        case O_GT: return a > b;
-        case O_LE: return a <= b;
-        case O_GE: return a >= b;
-        }
-        return 0;
-    }
-    case X_AR: {
-        double a = numx(ev(p, x->a)), b = numx(ev(p, x->b));
-        if (x->mode == M_INT) return wrap_to(int_op(x->o, a, b), x->ty);
-        return flt_op(x->o, a, b);
+        return bin_ev(p, x, ev(p, x->a));
+    case X_CHAIN: {
+        double v = ev(p, x->a);
+        for (uint16_t i = 0; i < x->n; i++) v = bin_ev(p, x->args[i], v);
+        return v;
     }
     case X_CONV: {
         double v = ev(p, x->a);
@@ -2273,9 +2520,9 @@ static double eval_fn(plc_t *p, sx_t *x)
 {
     double a0 = 0, a1 = 0, a2 = 0;
     if (x->fn == F_LEN) return str_len(p, x->args[0]);
-    if (x->nargs > 0) a0 = ev(p, x->args[0]);
-    if (x->nargs > 1) a1 = ev(p, x->args[1]);
-    if (x->nargs > 2) a2 = ev(p, x->args[2]);
+    if (x->n > 0) a0 = ev(p, x->args[0]);
+    if (x->n > 1) a1 = ev(p, x->args[1]);
+    if (x->n > 2) a2 = ev(p, x->args[2]);
     double n0 = numx(a0);
     switch (x->fn) {
     case F_ABS: return wrap_to(fabs(n0), x->ty);
@@ -2298,7 +2545,7 @@ static double eval_fn(plc_t *p, sx_t *x)
     case F_MIN:
     case F_MAX: {
         double r = n0;
-        for (uint16_t i = 1; i < x->nargs; i++) {
+        for (uint16_t i = 1; i < x->n; i++) {
             double v = numx(i == 1 ? a1 : i == 2 ? a2 : ev(p, x->args[i]));
             r = x->fn == F_MIN ? fmin(r, v) : fmax(r, v);
         }
@@ -2341,7 +2588,7 @@ static size_t evs(plc_t *p, sx_t *x, char *out, size_t cap)
 {
     switch (x->op) {
     case X_KS: {
-        size_t n = x->sl < cap - 1 ? x->sl : cap - 1;
+        size_t n = x->n < cap - 1 ? x->n : cap - 1;
         memcpy(out, x->s, n);
         out[n] = 0;
         return n;
@@ -2470,78 +2717,94 @@ static __attribute__((noinline)) void set_str(plc_t *p, ss_t *s)
     size_t n = evs(p, s->e, v, sizeof v);
     ty_str_write(b, s->p->ty, v, n);
 }
+/* the loops and CASE live outside run_s: its frame is what nested IF /
+ * statement lists cost on the stack */
+static __attribute__((noinline)) int run_case(plc_t *p, ss_t *s)
+{
+    double v = numx(ev(p, s->e));
+    for (uint16_t i = 0; i < s->narms; i++) {
+        sarm_t *a = &s->arms[i];
+        for (uint16_t j = 0; j < a->nlab; j++)
+            if (v >= a->lo[j] && v <= a->hi[j]) return run_list(p, a->body);
+    }
+    return s->els ? run_list(p, s->els) : 0;
+}
+static __attribute__((noinline)) int run_for(plc_t *p, ss_t *s)
+{
+    double i = numx(ev(p, s->from));
+    double to = numx(ev(p, s->to));
+    double by = s->by ? numx(ev(p, s->by)) : 1;
+    if (by == 0) return 0;
+    long guard = 0;
+    for (; by > 0 ? i <= to : i >= to; i += by) {
+        if (++guard > MAX_ITER) {
+            plc_errorf(p, "FOR loop stopped after %d iterations", MAX_ITER);
+            break;
+        }
+        write_p(p, s->p, i);
+        int sig = run_list(p, s->body);
+        if (sig == SIG_EXIT) break;
+        if (sig == SIG_RET) return SIG_RET;
+    }
+    return 0;
+}
+static __attribute__((noinline)) int run_while(plc_t *p, ss_t *s)
+{
+    long guard = 0;
+    while (tb(ev(p, s->e))) {
+        if (++guard > MAX_ITER) {
+            plc_errorf(p, "WHILE loop stopped after %d iterations", MAX_ITER);
+            break;
+        }
+        int sig = run_list(p, s->body);
+        if (sig == SIG_EXIT) break;
+        if (sig == SIG_RET) return SIG_RET;
+    }
+    return 0;
+}
+static __attribute__((noinline)) int run_repeat(plc_t *p, ss_t *s)
+{
+    long guard = 0;
+    do {
+        if (++guard > MAX_ITER) {
+            plc_errorf(p, "REPEAT loop stopped after %d iterations", MAX_ITER);
+            break;
+        }
+        int sig = run_list(p, s->body);
+        if (sig == SIG_EXIT) break;
+        if (sig == SIG_RET) return SIG_RET;
+    } while (!tb(ev(p, s->e)));
+    return 0;
+}
+static __attribute__((noinline)) void run_copy(plc_t *p, ss_t *s)
+{
+    uint8_t *a, *b, ab, bb;
+    if (loc_of(p, s->src, &a, &ab) && loc_of(p, s->p, &b, &bb)) memmove(b, a, s->size);
+}
+static __attribute__((noinline)) void run_set(plc_t *p, ss_t *s)
+{
+    double v = ev(p, s->e);
+    if (s->p) write_p(p, s->p, v);
+}
 static int run_s(plc_t *p, ss_t *s)
 {
+    if (plc_stack_low(p)) {
+        plc_errorf(p, "Statements " PLC_STACK_MSG " - block ended early");
+        return SIG_RET;
+    }
     switch (s->s) {
-    case S_SET: {
-        double v = ev(p, s->e);
-        if (s->p) write_p(p, s->p, v);
-        return 0;
-    }
+    case S_SET: run_set(p, s); return 0;
     case S_SETS: set_str(p, s); return 0;
-    case S_COPY: {
-        uint8_t *a, *b, ab, bb;
-        if (loc_of(p, s->src, &a, &ab) && loc_of(p, s->p, &b, &bb)) memmove(b, a, s->size);
-        return 0;
-    }
+    case S_COPY: run_copy(p, s); return 0;
     case S_CALL: run_call(p, s->call); return 0;
     case S_IF:
         for (uint16_t i = 0; i < s->narms; i++)
             if (tb(ev(p, s->arms[i].c))) return run_list(p, s->arms[i].body);
         return s->els ? run_list(p, s->els) : 0;
-    case S_CASE: {
-        double v = numx(ev(p, s->e));
-        for (uint16_t i = 0; i < s->narms; i++) {
-            sarm_t *a = &s->arms[i];
-            for (uint16_t j = 0; j < a->nlab; j++)
-                if (v >= a->lo[j] && v <= a->hi[j]) return run_list(p, a->body);
-        }
-        return s->els ? run_list(p, s->els) : 0;
-    }
-    case S_FOR: {
-        double i = numx(ev(p, s->from));
-        double to = numx(ev(p, s->to));
-        double by = s->by ? numx(ev(p, s->by)) : 1;
-        if (by == 0) return 0;
-        long guard = 0;
-        for (; by > 0 ? i <= to : i >= to; i += by) {
-            if (++guard > MAX_ITER) {
-                plc_errorf(p, "FOR loop stopped after %d iterations", MAX_ITER);
-                break;
-            }
-            write_p(p, s->p, i);
-            int sig = run_list(p, s->body);
-            if (sig == SIG_EXIT) break;
-            if (sig == SIG_RET) return SIG_RET;
-        }
-        return 0;
-    }
-    case S_WHILE: {
-        long guard = 0;
-        while (tb(ev(p, s->e))) {
-            if (++guard > MAX_ITER) {
-                plc_errorf(p, "WHILE loop stopped after %d iterations", MAX_ITER);
-                break;
-            }
-            int sig = run_list(p, s->body);
-            if (sig == SIG_EXIT) break;
-            if (sig == SIG_RET) return SIG_RET;
-        }
-        return 0;
-    }
-    case S_REPEAT: {
-        long guard = 0;
-        do {
-            if (++guard > MAX_ITER) {
-                plc_errorf(p, "REPEAT loop stopped after %d iterations", MAX_ITER);
-                break;
-            }
-            int sig = run_list(p, s->body);
-            if (sig == SIG_EXIT) break;
-            if (sig == SIG_RET) return SIG_RET;
-        } while (!tb(ev(p, s->e)));
-        return 0;
-    }
+    case S_CASE: return run_case(p, s);
+    case S_FOR: return run_for(p, s);
+    case S_WHILE: return run_while(p, s);
+    case S_REPEAT: return run_repeat(p, s);
     case S_BLOCK: return run_list(p, s->body);
     case S_EXIT: return SIG_EXIT;
     case S_CONT: return SIG_CONT;
@@ -2561,15 +2824,15 @@ static int run_list(plc_t *p, ss_t *s)
 /* =================================================================== API */
 static void cx_free(cx_t *cx)
 {
-    pchunk_t *c = cx->scratch;
-    while (c) {
-        pchunk_t *n = c->next;
-        free(c);
-        c = n;
-    }
-    cx->scratch = NULL;
-    free(cx->toks);
-    cx->toks = NULL;
+    intern_free(cx);
+    pchunk_t *lists[2] = {cx->scratch, cx->strs};
+    for (int k = 0; k < 2; k++)
+        for (pchunk_t *c = lists[k]; c;) {
+            pchunk_t *n = c->next;
+            chunk_free(cx, c);
+            c = n;
+        }
+    cx->scratch = cx->strs = NULL;
 }
 
 bool plc_scl_compile(plc_t *p, unit_t *u, const char *src, ss_t **out, char *err, size_t errlen)
@@ -2580,6 +2843,7 @@ bool plc_scl_compile(plc_t *p, unit_t *u, const char *src, ss_t **out, char *err
         return false;
     }
     cx->p = p;
+    cx->sp = p;
     cx->u = u;
     cx->t = u->mem.t;
     cx->src = src;
@@ -2596,44 +2860,100 @@ bool plc_scl_compile(plc_t *p, unit_t *u, const char *src, ss_t **out, char *err
         return false;
     }
     if (!cx->t) fail_at(cx, 0, "%s", u->blk->ty_err ? u->blk->ty_err : "interface error");
-    tokenize(cx);
-    an_t **body;
-    uint16_t nbody;
-    p_stmts(cx, stop_eof, &body, &nbody);
-    if (peek(cx)->t != T_EOF) perr(cx, "Unexpected token");
-    *out = list_c(cx, body, nbody);
+    cx->slen = strlen(src);
+    cx->sline = cx->scol = 1;
+    /* parse and compile one top-level statement at a time: its AST and the
+     * places built on the way are released before the next one */
+    ss_t *head = NULL, **tail = &head;
+    while (peek(cx)->t != T_EOF) {
+        if (accept_op(cx, ";")) continue;
+        smark_t m = sa_mark(cx);
+        an_t *a = p_stmt(cx);
+        ss_t *st = stmt_c(cx, a);
+        sa_release(cx, m);
+        *tail = st;
+        tail = &st->next;
+    }
+    *out = head;
     cx_free(cx);
     free(cx);
     return true;
 }
 
+/* the first child is followed in a loop: a chain like a + b + c + ... is a
+ * left-deep tree as deep as it is long */
 static void called_walk(an_t *a, void (*cb)(void *ctx, const char *name), void *ctx, int depth)
 {
-    if (!a || depth > 200) return;
-    if (a->n == AN_CALL && a->a && a->a->n == AN_NAME && !a->a->local) cb(ctx, a->a->s);
-    an_t *kids[4] = {a->a, a->b, a->c, a->d};
-    for (int i = 0; i < 4; i++) called_walk(kids[i], cb, ctx, depth + 1);
-    for (uint16_t i = 0; i < a->nlist; i++) called_walk(a->list[i], cb, ctx, depth + 1);
-    for (uint16_t i = 0; i < a->nbody; i++) called_walk(a->body[i], cb, ctx, depth + 1);
-    for (uint16_t i = 0; i < a->nels; i++) called_walk(a->els[i], cb, ctx, depth + 1);
+    for (; a && depth <= 200; a = a->a) {
+        if (a->n == AN_CALL && a->a && a->a->n == AN_NAME && !a->a->local) cb(ctx, a->a->s);
+        called_walk(a->b, cb, ctx, depth + 1);
+        called_walk(a->c, cb, ctx, depth + 1);
+        called_walk(a->d, cb, ctx, depth + 1);
+        for (uint16_t i = 0; i < a->nlist; i++) called_walk(a->list[i], cb, ctx, depth + 1);
+        for (uint16_t i = 0; i < a->nbody; i++) called_walk(a->body[i], cb, ctx, depth + 1);
+        for (uint16_t i = 0; i < a->nels; i++) called_walk(a->els[i], cb, ctx, depth + 1);
+    }
 }
 
-void plc_scl_called(const char *src, void (*cb)(void *ctx, const char *name), void *ctx)
+typedef struct {
+    char **v;
+    size_t n, c;
+} names_t;
+static void collect_name(void *ctx, const char *name)
+{
+    names_t *col = (names_t *)ctx;
+    if (col->n >= col->c) {
+        size_t nc = col->c ? col->c * 2 : 16;
+        char **nv = (char **)realloc(col->v, nc * sizeof(char *));
+        if (!nv) return;
+        col->v = nv;
+        col->c = nc;
+    }
+    size_t l = strlen(name);
+    char *d = (char *)malloc(l + 1);
+    if (!d) return;
+    memcpy(d, name, l + 1);
+    col->v[col->n++] = d;
+}
+static void names_free(names_t *col)
+{
+    for (size_t i = 0; i < col->n; i++) free(col->v[i]);
+    free(col->v);
+    col->v = NULL;
+    col->n = col->c = 0;
+}
+
+/* names are reported only when the whole block parses (scl.js calledNames) */
+void plc_scl_called(plc_t *p, const char *src, void (*cb)(void *ctx, const char *name), void *ctx)
 {
     cx_t *cx = (cx_t *)calloc(1, sizeof(cx_t));
-    if (!cx) return;
+    names_t *col = (names_t *)calloc(1, sizeof(names_t));
+    if (!cx || !col) {
+        free(cx);
+        free(col);
+        return;
+    }
+    cx->sp = p;
     cx->src = src;
+    cx->slen = strlen(src);
+    cx->sline = cx->scol = 1;
     if (setjmp(cx->jb)) {
+        names_free(col);
+        free(col);
         cx_free(cx);
         free(cx);
         return;
     }
-    tokenize(cx);
-    an_t **body;
-    uint16_t nbody;
-    p_stmts(cx, stop_eof, &body, &nbody);
-    if (peek(cx)->t == T_EOF)
-        for (uint16_t i = 0; i < nbody; i++) called_walk(body[i], cb, ctx, 0);
+    while (peek(cx)->t != T_EOF) {
+        if (accept_op(cx, ";")) continue;
+        smark_t m = sa_mark(cx);
+        an_t *a = p_stmt(cx);
+        called_walk(a, collect_name, col, 0);
+        sa_release(cx, m);
+    }
+    for (size_t i = 0; i < col->n; i++) cb(ctx, col->v[i]);
+    names_free(col);
+    free(col);
     cx_free(cx);
     free(cx);
 }

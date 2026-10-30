@@ -387,13 +387,35 @@ struct plc {
     double now;
     int depth;
     bool oom;
+    uintptr_t stk_base;     /* stack position at the API entry (plc_stack_low) */
+    void *tmps;             /* plc_tmp_alloc blocks in use */
 
     const jd_doc_t *doc;    /* compile time only */
 };
 
+/* C stack guard: the recursive paths (SCL parser / compiler / evaluator, block
+ * calls, nested data types) give up cleanly once the stack has grown more than
+ * env.stack_limit below the API entry point that set stk_base. */
+static inline void plc_stack_mark(plc_t *p)
+{
+    char here;
+    p->stk_base = (uintptr_t)&here;
+}
+static inline bool plc_stack_low(const plc_t *p)
+{
+    char here;
+    uintptr_t a = (uintptr_t)&here;
+    return p->env.stack_limit && (a < p->stk_base ? p->stk_base - a : a - p->stk_base) > p->env.stack_limit;
+}
+#define PLC_STACK_MSG "nested too deeply for the PLC's stack"
+
 /* -------------------------------------------- engine services (plc_engine.c) */
 void *plc_ar_alloc(plc_t *p, size_t n);
 char *plc_ar_strdup(plc_t *p, const char *s, size_t n);
+/* temporary heap block (compile time: out of memory longjmps out); free with
+ * plc_tmp_free. Keeps big buffers out of the frames of recursive paths. */
+void *plc_tmp_alloc(plc_t *p, size_t n);
+void plc_tmp_free(plc_t *p, void *x);
 void plc_warnf(plc_t *p, const char *fmt, ...);
 void plc_errorf(plc_t *p, const char *fmt, ...);
 
@@ -460,4 +482,4 @@ bool plc_scl_compile(plc_t *p, struct unit *u, const char *src, struct scl_stmt 
                      char *err, size_t errlen);
 void plc_scl_run(plc_t *p, struct unit *u);
 /* names a block's code calls ("FC"(..), "InstanceDB"(..), FC(..)) — syntax only */
-void plc_scl_called(const char *src, void (*cb)(void *ctx, const char *name), void *ctx);
+void plc_scl_called(plc_t *p, const char *src, void (*cb)(void *ctx, const char *name), void *ctx);

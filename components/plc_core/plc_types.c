@@ -326,10 +326,34 @@ static void trim_into(const char *s, size_t n, char *out, size_t cap)
 
 static const ty_t *udt_type(plc_t *p, size_t u, char *err, size_t errlen);
 
-const ty_t *ty_parse(plc_t *p, const char *str, int members_json, char *err, size_t errlen)
+/* What a type text names. The text work (and its buffers) stays in
+ * ty_classify(); ty_parse() only recurses — array element, struct, UDT, FB —
+ * with a small frame, since nested types recurse through it. */
+enum { TP_DONE, TP_ARRAY, TP_STRUCT, TP_UDT, TP_FB };
+typedef struct {
+    uint8_t kind, nd;
+    const ty_t *t;          /* TP_DONE: the type (NULL: error in err) */
+    const char *el;         /* TP_ARRAY: element type text (inside str) */
+    int32_t lo[TY_MAX_DIMS], hi[TY_MAX_DIMS];
+    size_t udt;             /* TP_UDT */
+    blk_t *fb;              /* TP_FB */
+} tparse_t;
+
+#undef TERR
+#define TERR(...)                                   \
+    do {                                            \
+        if (err && errlen) snprintf(err, errlen, __VA_ARGS__); \
+        return;                                     \
+    } while (0)
+static __attribute__((noinline)) void ty_classify(plc_t *p, const char *str, char *err, size_t errlen, tparse_t *r)
 {
+    r->kind = TP_DONE;
+    r->t = NULL;
     char s[256];
-    trim_into(str ? str : "", str ? strlen(str) : 0, s, sizeof s);
+    size_t lead = 0;
+    if (!str) str = "";
+    while (isws(str[lead])) lead++;
+    trim_into(str, strlen(str), s, sizeof s);
     if (!*s) TERR("missing data type");
     /* Array[lo..hi, ...] of T */
     if (iprefix(s, "array")) {
@@ -341,7 +365,6 @@ const ty_t *ty_parse(plc_t *p, const char *str, int members_json, char *err, siz
             if (of) {
                 while (isws(*of)) of++;
                 if (iprefix(of, "of") && isws(of[2])) {
-                    int32_t lo[TY_MAX_DIMS + 1], hi[TY_MAX_DIMS + 1];
                     uint8_t nd = 0;
                     const char *d = q + 1;
                     uint64_t count = 1;
@@ -366,20 +389,18 @@ const ty_t *ty_parse(plc_t *p, const char *str, int members_json, char *err, siz
                         if (b < a) TERR("array upper bound below lower bound");
                         if (nd >= TY_MAX_DIMS) TERR("too many array dimensions");
                         if (a < -2147483647L || b > 2147483647L) TERR("array too large (more than 65535 elements)");
-                        lo[nd] = (int32_t)a;
-                        hi[nd] = (int32_t)b;
+                        r->lo[nd] = (int32_t)a;
+                        r->hi[nd] = (int32_t)b;
                         nd++;
                         count *= (uint64_t)(b - a + 1);
                         if (count > 65535) TERR("array too large (more than 65535 elements)");
                         d = e < close ? e + 1 : close;
                     }
                     if (!nd) TERR("bad array bounds \"\"");
-                    const ty_t *el = ty_parse(p, of + 3, members_json, err, errlen);
-                    if (!el) return NULL;
-                    if (el->k == TK_VARIANT) TERR("Array of Variant is not allowed");
-                    ty_t *t = mk_array(p, lo, hi, nd, el);
-                    if (t->size > 65534) TERR("array too large (%u bytes)", (unsigned)t->size);
-                    return t;
+                    r->nd = nd;
+                    r->el = str + lead + (size_t)(of + 3 - s);
+                    r->kind = TP_ARRAY;
+                    return;
                 }
             }
         }
@@ -402,11 +423,18 @@ const ty_t *ty_parse(plc_t *p, const char *str, int members_json, char *err, siz
         }
         if (ok) {
             if (n < 1 || n > 254) TERR("String length must be 1..254");
-            return mk_string(p, (uint16_t)n);
+            r->t = mk_string(p, (uint16_t)n);
+            return;
         }
     }
-    if (plc_ieq(s, "struct")) return ty_struct_of(p, members_json, "", err, errlen);
-    if (plc_ieq(s, "variant")) return &TY_VARIANT;
+    if (plc_ieq(s, "struct")) {
+        r->kind = TP_STRUCT;
+        return;
+    }
+    if (plc_ieq(s, "variant")) {
+        r->t = &TY_VARIANT;
+        return;
+    }
     bool quoted = s[0] == '"';
     char name[160];
     size_t sl = strlen(s);
@@ -418,26 +446,61 @@ const ty_t *ty_parse(plc_t *p, const char *str, int members_json, char *err, siz
     up[i] = 0;
     if (!quoted) {
         const ty_t *e = el_by_name(up);
-        if (e) return e;
-        e = ty_builtin_struct(p, name);
-        if (e) return e;
-        e = plc_sysfb_type(p, name);
-        if (e) return e;
+        if (!e) e = ty_builtin_struct(p, name);
+        if (!e) e = plc_sysfb_type(p, name);
+        if (e) {
+            r->t = e;
+            return;
+        }
     }
     for (size_t u = 0; u < p->nudt; u++)
-        if (plc_ieq(p->udt_name[u], name)) return udt_type(p, u, err, errlen);
+        if (plc_ieq(p->udt_name[u], name)) {
+            r->kind = TP_UDT;
+            r->udt = u;
+            return;
+        }
     blk_t *fb = plc_find_block_name(p, name);
     if (fb && fb->type == BT_FB) {
-        const ty_t *t = plc_block_type(p, fb);
-        if (!t) {
-            if (fb->ty_state == 1) TERR("FB \"%s\" contains an instance of itself", name);
-            TERR("%s", fb->ty_err ? fb->ty_err : "?");
-        }
-        return t;
+        /* the message if it turns out to contain itself */
+        if (err && errlen) snprintf(err, errlen, "FB \"%s\" contains an instance of itself", name);
+        r->kind = TP_FB;
+        r->fb = fb;
+        return;
     }
     TERR("unknown data type \"%s\"", s);
 }
+#undef TERR
+#define TERR(...)                                   \
+    do {                                            \
+        if (err && errlen) snprintf(err, errlen, __VA_ARGS__); \
+        return NULL;                                \
+    } while (0)
 
+
+const ty_t *ty_parse(plc_t *p, const char *str, int members_json, char *err, size_t errlen)
+{
+    if (plc_stack_low(p)) TERR("data types " PLC_STACK_MSG);
+    tparse_t r;
+    ty_classify(p, str, err, errlen, &r);
+    switch (r.kind) {
+    case TP_ARRAY: {
+        const ty_t *el = ty_parse(p, r.el, members_json, err, errlen);
+        if (!el) return NULL;
+        if (el->k == TK_VARIANT) TERR("Array of Variant is not allowed");
+        ty_t *t = mk_array(p, r.lo, r.hi, r.nd, el);
+        if (t->size > 65534) TERR("array too large (%u bytes)", (unsigned)t->size);
+        return t;
+    }
+    case TP_STRUCT: return ty_struct_of(p, members_json, "", err, errlen);
+    case TP_UDT: return udt_type(p, r.udt, err, errlen);
+    case TP_FB: {
+        const ty_t *t = plc_block_type(p, r.fb);
+        if (!t && r.fb->ty_state != 1) TERR("%s", r.fb->ty_err ? r.fb->ty_err : "?");
+        return t; /* NULL: contains itself, err already says so */
+    }
+    }
+    return r.t;
+}
 static const ty_t *udt_type(plc_t *p, size_t u, char *err, size_t errlen)
 {
     if (p->udt_state[u] == 2) return p->udt_ty[u];
@@ -470,31 +533,38 @@ static fld_t *member_fields(plc_t *p, int arr, uint16_t *count, char *err, size_
     uint32_t total = jd_count(p->doc, arr);
     fld_t *f = (fld_t *)plc_ar_alloc(p, sizeof(fld_t) * (total + extra + 1));
     uint16_t n = 0;
-    char name[160], dt[256], def[256];
+    /* nested types recurse through here: the texts live on the heap */
+    struct {
+        char name[160], nm[160], dt[256], def[256], e2[160];
+    } *w = plc_tmp_alloc(p, sizeof *w);
+    if (!w) {
+        if (err && errlen) snprintf(err, errlen, "out of memory");
+        return NULL;
+    }
     for (int m = jd_first(p->doc, arr); m >= 0; m = jd_next(p->doc, m)) {
         if (jd_type(p->doc, m) != JD_OBJ) continue;
-        jtext(p, jd_get(p->doc, m, "name"), name, sizeof name);
-        char nm[160];
-        trim_into(name, strlen(name), nm, sizeof nm);
-        if (!*nm) continue;
-        jtext(p, jd_get(p->doc, m, "dataType"), dt, sizeof dt);
-        char e2[160];
-        const ty_t *t = ty_parse(p, dt, jd_get(p->doc, m, "members"), e2, sizeof e2);
+        jtext(p, jd_get(p->doc, m, "name"), w->name, sizeof w->name);
+        trim_into(w->name, strlen(w->name), w->nm, sizeof w->nm);
+        if (!*w->nm) continue;
+        jtext(p, jd_get(p->doc, m, "dataType"), w->dt, sizeof w->dt);
+        const ty_t *t = ty_parse(p, w->dt, jd_get(p->doc, m, "members"), w->e2, sizeof w->e2);
         if (!t) {
-            if (err && errlen) snprintf(err, errlen, "%s: %s", nm, e2);
+            if (err && errlen) snprintf(err, errlen, "%s: %s", w->nm, w->e2);
+            plc_tmp_free(p, w);
             return NULL;
         }
         int dv = jd_get(p->doc, m, "default");
-        f[n].name = plc_ar_strdup(p, nm, strlen(nm));
+        f[n].name = plc_ar_strdup(p, w->nm, strlen(w->nm));
         f[n].t = t;
         f[n].def = NULL;
         if (dv >= 0 && jd_type(p->doc, dv) != JD_NULL) {
-            jtext(p, dv, def, sizeof def);
-            f[n].def = plc_ar_strdup(p, def, strlen(def));
+            jtext(p, dv, w->def, sizeof w->def);
+            f[n].def = plc_ar_strdup(p, w->def, strlen(w->def));
         }
         f[n].sec = sec;
         n++;
     }
+    plc_tmp_free(p, w);
     *count = n;
     return f;
 }
@@ -582,7 +652,7 @@ static void sb_add(sb_t *s, const char *x)
 }
 static void sig_into(sb_t *s, const ty_t *t)
 {
-    char tmp[64];
+    char tmp[40];
     switch (t->k) {
     case TK_EL: sb_add(s, t->name); return;
     case TK_STR: snprintf(tmp, sizeof tmp, "S%u", t->len); sb_add(s, tmp); return;
@@ -601,11 +671,11 @@ static void sig_into(sb_t *s, const ty_t *t)
         sb_add(s, "{");
         for (uint16_t i = 0; i < t->nf; i++) {
             if (i) sb_add(s, ";");
-            char low[160];
-            size_t k = 0;
-            for (; t->f[i].name[k] && k + 1 < sizeof low; k++) low[k] = lwc(t->f[i].name[k]);
-            low[k] = 0;
-            sb_add(s, low);
+            const char *nm = t->f[i].name;
+            for (size_t k = 0; nm[k] && k < 159; k++) {
+                char c[2] = {lwc(nm[k]), 0};
+                sb_add(s, c);
+            }
             snprintf(tmp, sizeof tmp, "@%lu.%u:", (unsigned long)t->f[i].off, t->f[i].bit);
             sb_add(s, tmp);
             sig_into(s, t->f[i].t);
@@ -1011,6 +1081,87 @@ static int split_top(const char *s, const char **parts, size_t *lens, int maxp)
     return n;
 }
 
+/* array start values: per-element default texts "[1, 2]", "16(0)", or one
+ * value for all. Element types recurse into ty_init(), so the split-up texts
+ * live on the heap, not in this frame. */
+static __attribute__((noinline)) void str_init(uint8_t *b, const ty_t *t, const char *def)
+{
+    b[0] = (uint8_t)t->len;
+    char sv[256];
+    double dummy;
+    if (def && ty_literal(def, &dummy, sv, sizeof sv) == 2) ty_str_write(b, t, sv, strlen(sv));
+}
+static void arr_init(plc_t *p, uint8_t *b, const ty_t *t, const char *def)
+{
+    struct {
+        const char *vals[64];
+        size_t vlen[64];
+        const char *parts[64];
+        size_t lens[64];
+        char s[256], part[128], d[128];
+    } *w = NULL;
+    int nv = 0;
+    bool all = false;
+    if (def && *def && (w = plc_tmp_alloc(p, sizeof *w)) != NULL) {
+        trim_into(def, strlen(def), w->s, sizeof w->s);
+        char *s = w->s;
+        size_t sl = strlen(s);
+        char *body = s;
+        if (sl >= 2 && s[0] == '[' && s[sl - 1] == ']') s[sl - 1] = 0, body = s + 1;
+        if (*s) {
+            int np = split_top(body, w->parts, w->lens, 64);
+            if (np > 64) np = 64;
+            const char *p0 = w->parts[0];
+            while (np && isws(*p0)) p0++;
+            bool rep0 = false;
+            if (np) {
+                const char *q = p0;
+                if (isdig(*q)) {
+                    while (isdig(*q)) q++;
+                    while (isws(*q)) q++;
+                    rep0 = *q == '(';
+                }
+            }
+            if (np == 1 && !rep0) {
+                all = true;
+                w->vals[0] = w->parts[0], w->vlen[0] = w->lens[0];
+                nv = 1;
+            } else {
+                for (int i = 0; i < np; i++) {
+                    trim_into(w->parts[i], w->lens[i], w->part, sizeof w->part);
+                    char *e;
+                    long rep = isdig(w->part[0]) ? strtol(w->part, &e, 10) : -1;
+                    if (rep >= 0) {
+                        while (isws(*e)) e++;
+                        size_t pl = strlen(e);
+                        if (*e == '(' && pl >= 2 && e[pl - 1] == ')') {
+                            /* n(value): point into the original text */
+                            const char *orig = w->parts[i];
+                            const char *open = strchr(orig, '(');
+                            const char *close = orig + w->lens[i];
+                            while (close > open && *(close - 1) != ')') close--;
+                            for (long r = 0; r < rep && nv < 64; r++)
+                                w->vals[nv] = open + 1, w->vlen[nv] = (size_t)(close - 1 - (open + 1)), nv++;
+                            continue;
+                        }
+                    }
+                    if (nv < 64) w->vals[nv] = w->parts[i], w->vlen[nv] = w->lens[i], nv++;
+                }
+            }
+        }
+    }
+    for (uint32_t i = 0; i < t->count; i++) {
+        const char *dp = NULL;
+        int idx = all ? 0 : (int)i;
+        if (nv && idx < nv) {
+            trim_into(w->vals[idx], w->vlen[idx], w->d, sizeof w->d);
+            dp = w->d;
+        }
+        if (t->el->k == TK_EL && t->el->cls == TC_BOOL) ty_init(p, b + (i >> 3), (uint8_t)(i & 7), t->el, dp);
+        else ty_init(p, b + i * t->stride, 0, t->el, dp);
+    }
+    plc_tmp_free(p, w);
+}
 void ty_init(plc_t *p, uint8_t *b, uint8_t bit, const ty_t *t, const char *def)
 {
     switch (t->k) {
@@ -1019,87 +1170,13 @@ void ty_init(plc_t *p, uint8_t *b, uint8_t bit, const ty_t *t, const char *def)
         if (def && legacy_default(def, t, &v)) ty_write(b, bit, t, ty_conv(v, t));
         return;
     }
-    case TK_STR: {
-        b[0] = (uint8_t)t->len;
-        char sv[256];
-        double dummy;
-        if (def && ty_literal(def, &dummy, sv, sizeof sv) == 2) ty_str_write(b, t, sv, strlen(sv));
-        return;
-    }
+    case TK_STR: str_init(b, t, def); return;
     case TK_STRUCT:
     case TK_FB:
         for (uint16_t i = 0; i < t->nf; i++)
             if (t->f[i].t->k != TK_VARIANT) ty_init(p, b + t->f[i].off, t->f[i].bit, t->f[i].t, t->f[i].def);
         return;
-    case TK_ARR: {
-        /* per-element default texts: "[1, 2]", "16(0)", or one value for all */
-        const char *vals[64];
-        size_t vlen[64];
-        int nv = 0;
-        bool all = false;
-        char s[256];
-        if (def) {
-            trim_into(def, strlen(def), s, sizeof s);
-            size_t sl = strlen(s);
-            char *body = s;
-            if (sl >= 2 && s[0] == '[' && s[sl - 1] == ']') s[sl - 1] = 0, body = s + 1;
-            if (*s) {
-                const char *parts[64];
-                size_t lens[64];
-                int np = split_top(body, parts, lens, 64);
-                if (np > 64) np = 64;
-                const char *p0 = parts[0];
-                while (np && isws(*p0)) p0++;
-                bool rep0 = false;
-                if (np) {
-                    const char *q = p0;
-                    if (isdig(*q)) {
-                        while (isdig(*q)) q++;
-                        while (isws(*q)) q++;
-                        rep0 = *q == '(';
-                    }
-                }
-                if (np == 1 && !rep0) {
-                    all = true;
-                    vals[0] = parts[0], vlen[0] = lens[0];
-                    nv = 1;
-                } else {
-                    for (int i = 0; i < np; i++) {
-                        char part[128];
-                        trim_into(parts[i], lens[i], part, sizeof part);
-                        char *e;
-                        long rep = isdig(part[0]) ? strtol(part, &e, 10) : -1;
-                        if (rep >= 0) {
-                            while (isws(*e)) e++;
-                            size_t pl = strlen(e);
-                            if (*e == '(' && pl >= 2 && e[pl - 1] == ')') {
-                                /* n(value): point into the original text */
-                                const char *orig = parts[i];
-                                const char *open = strchr(orig, '(');
-                                const char *close = orig + lens[i];
-                                while (close > open && *(close - 1) != ')') close--;
-                                for (long r = 0; r < rep && nv < 64; r++) vals[nv] = open + 1, vlen[nv] = (size_t)(close - 1 - (open + 1)), nv++;
-                                continue;
-                            }
-                        }
-                        if (nv < 64) vals[nv] = parts[i], vlen[nv] = lens[i], nv++;
-                    }
-                }
-            }
-        }
-        for (uint32_t i = 0; i < t->count; i++) {
-            char d[128];
-            const char *dp = NULL;
-            int idx = all ? 0 : (int)i;
-            if (nv && idx < nv) {
-                trim_into(vals[idx], vlen[idx], d, sizeof d);
-                dp = d;
-            }
-            if (t->el->k == TK_EL && t->el->cls == TC_BOOL) ty_init(p, b + (i >> 3), (uint8_t)(i & 7), t->el, dp);
-            else ty_init(p, b + i * t->stride, 0, t->el, dp);
-        }
-        return;
-    }
+    case TK_ARR: arr_init(p, b, t, def); return;
     default: return;
     }
 }

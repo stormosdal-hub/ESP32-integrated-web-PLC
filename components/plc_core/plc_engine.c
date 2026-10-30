@@ -46,6 +46,35 @@ static void h_free(plc_t *p, void *x)
     else free(x);
 }
 
+/* temporary blocks are listed so an out-of-memory longjmp out of the middle
+ * of a compile does not leak them (plc_destroy frees what is left) */
+typedef union tmp_hdr {
+    union tmp_hdr *next;
+    double align;
+} tmp_hdr_t;
+void *plc_tmp_alloc(plc_t *p, size_t n)
+{
+    tmp_hdr_t *h = (tmp_hdr_t *)h_alloc(p, sizeof(tmp_hdr_t) + n);
+    if (!h) {
+        oom(p);
+        return NULL;
+    }
+    h->next = (tmp_hdr_t *)p->tmps;
+    p->tmps = h;
+    return h + 1;
+}
+void plc_tmp_free(plc_t *p, void *x)
+{
+    if (!x) return;
+    tmp_hdr_t *h = (tmp_hdr_t *)x - 1;
+    for (tmp_hdr_t **pp = (tmp_hdr_t **)&p->tmps; *pp; pp = &(*pp)->next)
+        if (*pp == h) {
+            *pp = h->next;
+            break;
+        }
+    h_free(p, h);
+}
+
 #define AR_CHUNK 8192
 #define AR_HDR ((sizeof(ar_chunk_t) + 7) & ~(size_t)7)
 
@@ -1184,7 +1213,7 @@ static void mark_called(plc_t *p)
                 char *src = (char *)h_alloc(p, len + 1);
                 if (!src) oom(p);
                 jd_str(D, cv, src, len + 1);
-                plc_scl_called(src, mark_name, p);
+                plc_scl_called(p, src, mark_name, p);
                 h_free(p, src);
             }
         }
@@ -1200,48 +1229,55 @@ static void mark_called(plc_t *p)
 /* ---- block types (cached per block) ---- */
 blk_t *plc_find_block_id(plc_t *p, const char *id) { return find_block(p, id); }
 
+/* a data block's type: instance DB of an FB, DB of a PLC data type, or its own members */
+static const ty_t *db_type(plc_t *p, blk_t *b, char *err, size_t errlen)
+{
+    int io = jd_get(D, b->json, "instanceOf"), dt = jd_get(D, b->json, "dbType");
+    char buf[160];
+    if (io >= 0 && jd_type(D, io) != JD_NULL && (jd_str(D, io, buf, sizeof buf), *buf)) {
+        blk_t *fb = find_block(p, buf);
+        if (!fb || fb->type != BT_FB) {
+            snprintf(err, errlen, "instance DB of a missing FB");
+            return NULL;
+        }
+        const ty_t *t = plc_block_type(p, fb);
+        if (!t) snprintf(err, errlen, "%s", fb->ty_state == 1 ? "FB contains an instance of itself" : fb->ty_err ? fb->ty_err : "?");
+        return t;
+    }
+    if (dt >= 0 && jd_type(D, dt) != JD_NULL && (jd_str(D, dt, buf, sizeof buf), *buf)) {
+        char q[176], tr[160];
+        trim_copy(buf, tr, sizeof tr);
+        size_t l = strlen(tr);
+        if (l >= 2 && tr[0] == '"' && tr[l - 1] == '"') tr[l - 1] = 0, memmove(tr, tr + 1, l - 1);
+        snprintf(q, sizeof q, "\"%s\"", tr);
+        return ty_parse(p, q, -1, err, errlen);
+    }
+    return ty_struct_of(p, jd_get(D, b->json, "members"), b->name, err, errlen);
+}
+
 const ty_t *plc_block_type(plc_t *p, blk_t *b)
 {
     if (b->ty_state == 2) return b->ty;
     if (b->ty_state == 3 || b->ty_state == 1) return NULL;
     if (!p->doc) return NULL;            /* runtime: only what compile built */
     b->ty_state = 1;
-    char err[200] = "";
-    const ty_t *t = NULL;
-    if (b->type == BT_DB) {
-        int io = jd_get(D, b->json, "instanceOf"), dt = jd_get(D, b->json, "dbType");
-        char buf[160];
-        if (io >= 0 && jd_type(D, io) != JD_NULL && (jd_str(D, io, buf, sizeof buf), *buf)) {
-            blk_t *fb = find_block(p, buf);
-            if (!fb || fb->type != BT_FB) snprintf(err, sizeof err, "instance DB of a missing FB");
-            else {
-                t = plc_block_type(p, fb);
-                if (!t) snprintf(err, sizeof err, "%s", fb->ty_state == 1 ? "FB contains an instance of itself" : fb->ty_err ? fb->ty_err : "?");
-            }
-        } else if (dt >= 0 && jd_type(D, dt) != JD_NULL && (jd_str(D, dt, buf, sizeof buf), *buf)) {
-            char q[176], tr[160];
-            trim_copy(buf, tr, sizeof tr);
-            size_t l = strlen(tr);
-            if (l >= 2 && tr[0] == '"' && tr[l - 1] == '"') tr[l - 1] = 0, memmove(tr, tr + 1, l - 1);
-            snprintf(q, sizeof q, "\"%s\"", tr);
-            t = ty_parse(p, q, -1, err, sizeof err);
-        } else {
-            t = ty_struct_of(p, jd_get(D, b->json, "members"), b->name, err, sizeof err);
-        }
-    } else {
-        t = ty_block_fields(p, b, err, sizeof err);
-    }
+    /* FB types nest (multi-instances): the message buffer is on the heap */
+    enum { ERRLEN = 200 };
+    char *err = (char *)plc_tmp_alloc(p, ERRLEN);
+    err[0] = 0;
+    const ty_t *t = b->type == BT_DB ? db_type(p, b, err, ERRLEN) : ty_block_fields(p, b, err, ERRLEN);
     if (t && t->size > 65534) {
         t = NULL;
-        snprintf(err, sizeof err, "instance data larger than 64 KB");
+        snprintf(err, ERRLEN, "instance data larger than 64 KB");
     }
     if (!t) {
         b->ty_state = 3;
         b->ty_err = ar_dup(p, err);
-        return NULL;
+    } else {
+        b->ty = t;
+        b->ty_state = 2;
     }
-    b->ty = t;
-    b->ty_state = 2;
+    plc_tmp_free(p, err);
     return t;
 }
 
@@ -2593,6 +2629,16 @@ static void fbd_net(plc_t *p, net_t *net)
     for (uint16_t i = 0; i < net->nbox; i++) eval_box(p, net->boxes[i]);
 }
 
+/* LAD / FBD networks: kept out of run_unit's frame, which every block call nests */
+static __attribute__((noinline)) void run_nets(plc_t *p, unit_t *u)
+{
+    for (uint16_t i = 0; i < u->nnet; i++) {
+        net_t *net = &u->nets[i];
+        if (net->fbd) fbd_net(p, net);
+        else lad_net(p, net);
+    }
+}
+
 static void run_unit(plc_t *p, unit_t *u)
 {
     blk_t *b = u->blk;
@@ -2602,16 +2648,16 @@ static void run_unit(plc_t *p, unit_t *u)
                    PLC_MAX_CALL_DEPTH);
         return;
     }
+    if (plc_stack_low(p)) {
+        plc_errorf(p, "%s: calls " PLC_STACK_MSG " - call skipped", *b->name ? b->name : "?");
+        return;
+    }
     b->active = 1;
     p->depth++;
     if (b->lang == BL_SCL) {
         if (u->scl_ok && u->scl) plc_scl_run(p, u);
     } else {
-        for (uint16_t i = 0; i < u->nnet; i++) {
-            net_t *net = &u->nets[i];
-            if (net->fbd) fbd_net(p, net);
-            else lad_net(p, net);
-        }
+        run_nets(p, u);
     }
     p->depth--;
     b->active = 0;
@@ -2622,6 +2668,7 @@ void plc_run_unit(plc_t *p, unit_t *u) { run_unit(p, u); }
 void plc_scan(plc_t *p)
 {
     if (!p) return;
+    plc_stack_mark(p);
     p->now = p->env.now_ms(p->env.user);
     p->depth = 0;
     for (size_t i = 0; i < p->ncyc; i++) run_unit(p, p->cyc[i]);
@@ -2635,6 +2682,7 @@ static void plc_destroy(plc_t *p)
 {
     if (!p) return;
     plc_conns_close(p);
+    while (p->tmps) plc_tmp_free(p, (tmp_hdr_t *)p->tmps + 1);
     /* unit structs live in the arena: release their heap maps first */
     for (unit_t *u = p->units; u; u = u->next) smap_free(p, &u->mem.map);
     ar_chunk_t *c = p->ar.head;
@@ -2677,6 +2725,7 @@ plc_t *plc_load(const char *json, size_t len, const plc_env_t *env, char *err, s
     }
     memset(p, 0, sizeof *p);
     if (env) p->env = *env;
+    plc_stack_mark(p);
     p->scan_ms = 50;
 
     oom_ctx_t oc;
@@ -2778,6 +2827,7 @@ static bool same_cell(plc_t *p, cref_t a, cref_t b)
 int plc_force(plc_t *p, const char *key, plc_vtype_t t, double value)
 {
     if (!p || !key) return -1;
+    plc_stack_mark(p);
     oom_ctx_t oc;
     oc.p = p;
     oom_ctx_t *prev = s_oom;

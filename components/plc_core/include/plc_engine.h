@@ -87,6 +87,12 @@ typedef struct {
      * now_ms, starting at 1970-01-01 */
     double (*wall_ms)(void *user, bool local);
     const plc_net_t *net;           /* OUC transport; NULL -> virtual network */
+    /* C stack the engine may use below plc_load() / plc_scan() / plc_force()
+     * (bytes; 0 = unchecked). Past it a program nested too deeply fails to
+     * compile, or the block call / SCL statement is cut short with a runtime
+     * error, instead of overflowing the task stack. Keep room above it for
+     * the caller's frames and the deepest leaf calls (printf). */
+    size_t stack_limit;
 } plc_env_t;
 
 /* ---- hardware I/O points (from project.gpio) ----------------------------- */

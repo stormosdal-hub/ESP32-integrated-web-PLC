@@ -80,7 +80,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "cannot read input\n");
         return 2;
     }
-    plc_env_t env = {now_ms, NULL, dbg_alloc, dbg_alloc, dbg_free, wall_ms, NULL};
+    /* PLC_STACK_LIMIT: exercise the engine's stack guard (fuzz.py) */
+    const char *lim = getenv("PLC_STACK_LIMIT");
+    plc_env_t env = {now_ms, NULL, dbg_alloc, dbg_alloc, dbg_free, wall_ms, NULL, lim ? (size_t)atol(lim) : 0};
     char err[256];
     plc_t *p = plc_load(proj, plen, &env, err, sizeof err);
     if (!p) {

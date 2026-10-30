@@ -311,10 +311,12 @@
       if (tk.t === 'num' || tk.t === 'lid') return 1;
       return 0;
     }
+    // (the lookahead stops after 200 tokens: the C port reads tokens through a ring buffer)
     function isCaseBoundary() {
       if (isKw('END_CASE') || isKw('ELSE')) return true;
       let q = p;
       const skip = () => {
+        if (q - p > 200) return false;
         const a = labelLen(q); if (!a) return false; q += a;
         if (toks[q].t === 'op' && toks[q].v === '..') { q++; const b = labelLen(q); if (!b) return false; q += b; }
         return true;

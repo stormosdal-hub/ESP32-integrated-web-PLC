@@ -31,7 +31,8 @@ SCL = ['', '(', ')', ':=', 'END_IF', '(*', '#', '..', '1..', '#x', '"Data"', '%X
        '#con(REQ := TRUE, ID := 1, CONNECT := #con);', '#snd(REQ := TRUE, ID := 1, LEN := 70000, DATA := #p);',
        '#rcv(EN_R := TRUE, ID := 1, LEN := 0, DATA := #con);', 'INT#', 'WORD#16#', 'D#2024-13-40', 'TOD#25:99',
        'NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT NOT x', '((((((((((((((((((((',
-       'SHL(IN := 1, N := 99)', 'ROL(IN := DWORD#1, N := -5)', '#w.%X31 := TRUE;', 'MAX_LEN(#x)']
+       'SHL(IN := 1, N := 99)', 'ROL(IN := DWORD#1, N := -5)', '#w.%X31 := TRUE;', 'MAX_LEN(#x)',
+       '#x := 1' + ' + #x' * 400 + ';', 'IF TRUE' + ' AND #b' * 300 + ' THEN #x := 1; END_IF;']
 
 
 def mutate(node, rnd, depth=0):
