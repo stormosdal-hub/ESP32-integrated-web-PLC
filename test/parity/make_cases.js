@@ -693,6 +693,82 @@ END_ORGANIZATION_BLOCK
     { set: { Send: true }, scans: 1 }, { set: { Send: false }, scans: 2 }]);
 })();
 
+/* --------------- 10b. OUC boxes from the instruction pane, in LAD and FBD */
+(function oucBoxes() {
+  const p = project('OucBoxes');
+  tag(p, 'Go', 'Bool', 'I0.0'); tag(p, 'Send', 'Bool', 'I0.1'); tag(p, 'Drop', 'Bool', 'I0.2');
+  tag(p, 'Done1', 'Bool', 'M0.0'); tag(p, 'Done2', 'Bool', 'M0.1'); tag(p, 'SDone', 'Bool', 'M0.2');
+  tag(p, 'Ndr', 'Bool', 'M0.3'); tag(p, 'DDone', 'Bool', 'M0.4'); tag(p, 'Err', 'Bool', 'M0.5');
+  tag(p, 'St1', 'Word', 'MW2'); tag(p, 'St2', 'Word', 'MW4'); tag(p, 'SSt', 'Word', 'MW6'); tag(p, 'RSt', 'Word', 'MW8');
+  tag(p, 'RLen', 'Int', 'MW10'); tag(p, 'TxWord', 'Int', 'MW12'); tag(p, 'RxWord', 'Int', 'MW14');
+  tag(p, 'FDone', 'Bool', 'M1.0'); tag(p, 'FSt', 'Word', 'MW16'); tag(p, 'FNdr', 'Bool', 'M1.1'); tag(p, 'FNdr2', 'Bool', 'M1.2');
+  tag(p, 'CNdr', 'Bool', 'M1.3'); tag(p, 'S4', 'Word', 'MW18');
+  fromSource(p, `
+DATA_BLOCK "Conn"
+VERSION : 0.1
+   VAR
+      srv : TCON_IP_v4;
+      cli : TCON_IP_v4;
+      cli2 : TCON_IP_v4;
+      tx : Array[0..7] of Byte;
+      rx : Array[0..7] of Byte;
+   END_VAR
+BEGIN
+   srv.ID := 1; srv.ConnectionType := 11; srv.LocalPort := 2000;
+   cli.ID := 2; cli.ConnectionType := 11; cli.ActiveEstablished := TRUE;
+   cli.RemoteAddress.ADDR[1] := 127; cli.RemoteAddress.ADDR[4] := 1; cli.RemotePort := 2000;
+   cli2.ID := 4; cli2.ConnectionType := 11; cli2.ActiveEstablished := TRUE;
+   cli2.RemoteAddress.ADDR[1] := 127; cli2.RemoteAddress.ADDR[4] := 1; cli2.RemotePort := 2001;
+   tx[0] := 16#11; tx[1] := 16#22; tx[7] := 16#77;
+END_DATA_BLOCK
+
+DATA_BLOCK "Buf"
+VERSION : 0.1
+   VAR
+      a : Int;
+      b : Int;
+   END_VAR
+BEGIN
+   a := 1234; b := -5;
+END_DATA_BLOCK
+`);
+  // LAD: REQ / EN_R = rung power, the other pins are operands in params
+  const ob = block(p, 'OB', 'Main', 1, 'LAD');
+  ob.networks = [
+    lad('listen', [stage([el('contact_no', 'Go')])], [el('tcon', '', { id: '1', connect: '"Conn".srv', done: 'Done1', status: 'St1' })]),
+    lad('connect', [stage([el('contact_no', 'Go')])], [el('tcon', '', { id: '2', connect: 'Conn.cli', done: 'Done2', status: 'St2', error: 'Err' })]),
+    lad('send', [stage([el('contact_no', 'Send')])], [el('tsend', '', { id: '2', len: '8', data: '"Conn".tx', done: 'SDone', status: 'SSt' })]),
+    lad('receive', [], [el('trcv', '', { id: '1', len: '8', data: '"Conn".rx', ndr: 'Ndr', status: 'RSt', rcvd_len: 'RLen' })]),
+    lad('send a tag', [stage([el('contact_no', 'Send')])], [el('tsend', '', { id: '1', len: '0', data: 'TxWord' })]),
+    lad('receive a tag', [], [el('trcv', '', { id: '2', len: '2', data: 'RxWord', ndr: 'CNdr' })]),
+    lad('connect 2', [stage([el('contact_no', 'Go')])], [el('tcon', '', { id: '4', connect: '"Conn".cli2', status: 'S4' })]),
+    lad('send a DB', [stage([el('contact_no', 'Send')])], [el('tsend', '', { id: '4', len: '0', data: 'Buf' })]),
+    lad('no data', [stage([el('contact_no', 'Send')])], [el('tsend', '', { id: '4', len: '4', data: '"Conn".nothing' })]),
+    lad('drop', [stage([el('contact_no', 'Drop')])], [el('tdiscon', '', { id: '2', done: 'DDone' })]),
+  ];
+  // FBD in an FB: CONNECT / DATA are its own members, ID wired, outputs wired on
+  const fb = block(p, 'FB', 'Link', 1, 'FBD');
+  fb.iface.static.push(M.newMember('p', 'TCON_IP_v4', '', ''), M.newMember('rx', 'Array[0..3] of Byte', '', ''));
+  const mv1 = box('move', { in: '3', out: '#p.ID' }), mv2 = box('move', { in: '11', out: '#p.ConnectionType' });
+  const mv3 = box('move', { in: '2001', out: '#p.LocalPort' }), mvId = box('move', { in: '3', out: '' });
+  const con = box('tcon', { id: '9', connect: '#p', done: 'FDone' }, ['Go']);
+  const stm = box('move', { out: 'FSt' });
+  const rcv = box('trcv', { id: '3', len: '0', data: '#rx', ndr: 'FNdr' }, ['Go']);
+  const asg = box('assign'); asg.operand = 'FNdr2';
+  const fn = fbdNet('link', [mv1, mv2, mv3, mvId, con, stm, rcv, asg]);
+  wire(fn, mvId, 0, con, 1);          // ID from a wire (the param says 9)
+  wire(fn, con, 3, stm, 0);           // STATUS -> MOVE
+  wire(fn, rcv, 0, asg, 0);           // NDR -> assignment
+  fb.networks = [fn];
+  const db = instDb(p, fb, 'Link_DB');
+  const ob2 = block(p, 'OB', 'Cyclic', 2, 'FBD');
+  ob2.networks = [fbdNet('call', [callBox(fb, db)])];
+  save('ouc_boxes', p, [{ t: 0, scans: 1 }, { set: { Go: true, TxWord: 4660 }, scans: 3 }, { scans: 2 },
+    { set: { Send: true }, scans: 1 }, { set: { Send: false }, scans: 3 }, { set: { Send: true, TxWord: -2 }, scans: 1 },
+    { set: { Send: false }, scans: 3 }, { set: { Drop: true }, scans: 2 }, { set: { Drop: false, Go: false }, scans: 2 },
+    { set: { Go: true }, scans: 3 }]);
+})();
+
 /* ------------------------------------- 11. the TcpLink example, end to end */
 (function tcplink() {
   const p = project('TcpLink');

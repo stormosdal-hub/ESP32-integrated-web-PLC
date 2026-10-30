@@ -325,7 +325,8 @@
   function hasTitleBar(kind) {
     return ['compare', 'ton', 'tof', 'tp', 'ctu', 'ctd', 'ctud', 'move', 'add', 'sub', 'mul', 'div', 'call',
             'norm_x', 'scale_x',
-            'sr', 'rs', 'p_trig', 'n_trig', 'r_trig', 'f_trig'].indexOf(kind) >= 0;
+            'sr', 'rs', 'p_trig', 'n_trig', 'r_trig', 'f_trig',
+            'tcon', 'tdiscon', 'tsend', 'trcv'].indexOf(kind) >= 0;
   }
 
   /* Resolve a call box's target block to { title, sub } per shared decision #2. */
@@ -348,6 +349,7 @@
     const titled = hasTitleBar(boxObj.kind);
     // call boxes are wider so the target block name stays readable
     let w = titled ? 84 : G.boxW;
+    if (T.catalog[boxObj.kind] && T.catalog[boxObj.kind].group === 'Communication') w = 120;   // CONNECT | STATUS
     if (boxObj.kind === 'call') {
       const title = callInfo(boxObj).title;
       w = Math.max(96, Math.min(200, 44 + title.length * 7));
@@ -739,7 +741,8 @@
     g.appendChild(hit);
 
     // unwired INPUT pin: show its operand as an editable label to the left
-    if (!isOut && !isInputWired(net, boxObj.id, pin.id)) {
+    // (a pin that reads a params value — PT, PV, ID, DATA … — shows that instead)
+    if (!isOut && !isInputWired(net, boxObj.id, pin.id) && !inputParamMap(boxObj.kind)[pin.name]) {
       addOperandLabel(g, net, boxObj, 'pin-' + pin.id,
         tipX - 6, py + 3, 'end', pin.operand, (v) => { pin.operand = v; });
     }
@@ -853,7 +856,7 @@
       case 'move': return { IN: 'in' };
       case 'add': case 'sub': case 'mul': case 'div': return { in1: 'in1', in2: 'in2' };
       case 'norm_x': case 'scale_x': return { MIN: 'min', VALUE: 'val', MAX: 'max' };
-      default: return {};
+      default: return T.pinParams(kind, 'in');     // TCON / TSEND …: ID, LEN, CONNECT, DATA
     }
   }
   // Map a box pin NAME -> params key it writes (outputs).
@@ -865,7 +868,7 @@
       case 'move': return { OUT: 'out' };
       case 'add': case 'sub': case 'mul': case 'div': return { OUT: 'out', ENO: 'eno' };
       case 'norm_x': case 'scale_x': return { OUT: 'out', ENO: 'eno' };
-      default: return {};
+      default: return T.pinParams(kind, 'out');
     }
   }
 
@@ -1305,6 +1308,16 @@
     const n = (net.boxes || []).length;
     x += (n % 4) * 18;
     y += (n % 4) * 14;
+    // … and move below any box the new one would cover
+    const probe = T.model.newBox(kind, x, y), pg = boxGeom(probe);
+    for (let guard = 0; guard < 50; guard++) {
+      const hit = (net.boxes || []).find((b) => {
+        const g = boxGeom(b);
+        return x < b.x + g.w + 40 && b.x < x + pg.w + 40 && y < b.y + g.h + 20 && b.y < y + pg.h + 20;
+      });
+      if (!hit) break;
+      y = hit.y + boxGeom(hit).h + 30;
+    }
     insertAt(kind, net, Math.round(x / G.snap) * G.snap, Math.round(y / G.snap) * G.snap);
   }
 

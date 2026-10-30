@@ -411,7 +411,7 @@
     const outStartX = condEndX + G.railGap;
     // Output boxes (timers/counters/move/math) draw their out-pin tag labels (Q, ET, CV,
     // OUT) to the right of the box, so reserve extra room before the right rail.
-    const hasOutBox = outputs.some((e) => /^(ton|tof|tp|ctu|ctd|ctud|move|add|sub|mul|div|norm_x|scale_x)$/.test(e.kind));
+    const hasOutBox = outputs.some((e) => /^(ton|tof|tp|ctu|ctd|ctud|move|add|sub|mul|div|norm_x|scale_x|tcon|tdiscon|tsend|trcv)$/.test(e.kind));
     // Call boxes are wider (block name + %TYPEn) and have an ENO pin to the right.
     const hasCallBox = outputs.some((e) => e.kind === 'call');
     const reservedOut = outputs.length
@@ -647,10 +647,12 @@
     const pinsIn = (d.pins && d.pins.in) || [];
     const pinsOut = (d.pins && d.pins.out) || [];
     const rows = Math.max(pinsIn.length, pinsOut.length, 1);
-    const h = Math.max(40, 16 + rows * 16);
+    const h = tallBoxH(rows) || Math.max(40, 16 + rows * 16);
     const w = G.outBoxW;
     const x = startX + 14;
-    const y = cy - h / 2;
+    // a tall box (more than two pin rows) hangs from its slot's top instead of
+    // centring on the rung, so it stays inside its own (taller) output slot
+    const y = rows > 2 ? cy - 22 : cy - h / 2;
 
     // wire rung -> box EN (left side, top)
     svg.appendChild(wire(startX, cy, x, cy, net, 'bxen-' + el.id));
@@ -662,6 +664,7 @@
       move: 'MOVE', add: 'ADD', sub: 'SUB', mul: 'MUL', div: 'DIV',
       norm_x: 'NORM_X', scale_x: 'SCALE_X',
       sr: 'SR', rs: 'RS', p_trig: 'P_TRIG', n_trig: 'N_TRIG', r_trig: 'R_TRIG', f_trig: 'F_TRIG',
+      tcon: 'TCON', tdiscon: 'TDISCON', tsend: 'TSEND', trcv: 'TRCV',
     };
     g.appendChild(T.svg('text', {
       class: 'lad-box-title', x: x + w / 2, y: y + 13, 'text-anchor': 'middle',
@@ -684,7 +687,7 @@
       const py = y + 30 + i * 16;
       g.appendChild(T.svg('text', { class: 'lad-pin-label', x: x + 5, y: py + 3 }, pin));
       const pk = inParam[pin];
-      if (pk) paramLabel(g, el, pk, x - 6, py + 3, 'end');
+      if (pk) paramLabel(g, el, pk, x - 15, py + 3, 'end');   // clear of the stub
       // small stub
       g.appendChild(T.svg('line', { class: 'lad-wire', x1: x - 12, y1: py, x2: x, y2: py }));
     });
@@ -695,7 +698,7 @@
       const py = y + 30 + i * 16;
       g.appendChild(T.svg('text', { class: 'lad-pin-label', x: x + w - 5, y: py + 3, 'text-anchor': 'end' }, pin));
       const pk = outParam[pin];
-      if (pk) paramLabel(g, el, pk, x + w + 6, py + 3, 'start');
+      if (pk) paramLabel(g, el, pk, x + w + 15, py + 3, 'start');
       g.appendChild(T.svg('line', { class: 'lad-wire', x1: x + w, y1: py, x2: x + w + 12, y2: py }));
     });
 
@@ -717,7 +720,7 @@
       case 'norm_x': case 'scale_x': return { MIN: 'min', VALUE: 'val', MAX: 'max' };
       case 'sr': return { R1: 'r' };          // S = rung power; R1 = referenced bit
       case 'rs': return { S1: 's' };          // R = rung power; S1 = referenced bit
-      default: return {};
+      default: return T.pinParams(kind, 'in');   // TCON / TSEND …: REQ = rung power
     }
   }
   // Map a box pin name -> the params key it writes (outputs).
@@ -730,7 +733,7 @@
       case 'add': case 'sub': case 'mul': case 'div': return { OUT: 'out', ENO: 'eno' };
       case 'norm_x': case 'scale_x': return { OUT: 'out', ENO: 'eno' };
       case 'p_trig': case 'n_trig': case 'r_trig': case 'f_trig': return { Q: 'q' };
-      default: return {};
+      default: return T.pinParams(kind, 'out');
     }
   }
 
@@ -743,8 +746,14 @@
     return tb ? Math.max(T.ifaceCallInputs(tb).length, T.ifaceCallOutputs(tb).length) : 0;
   }
   // Vertical slot a stacked output occupies (call boxes are taller than a coil row).
+  // a box with more than two pin rows (CTUD, TCON, TRCV …): pin rows at
+  // 30 + i*16 below its top, room under the last one; 0 = a normal box
+  function tallBoxH(rows) { return rows > 2 ? 24 + rows * 16 : 0; }
   function outputSlotH(el) {
     if (el.kind === 'call') return Math.max(G.cellH, 34 + callBoxRows(el) * 17 + 8 + 12);
+    const pins = (def(el.kind) || {}).pins;
+    const rows = pins ? Math.max((pins.in || []).length, (pins.out || []).length) : 0;
+    if (rows > 2) return Math.max(G.cellH, tallBoxH(rows) + 12);   // renderOutputBox
     return G.cellH;
   }
 

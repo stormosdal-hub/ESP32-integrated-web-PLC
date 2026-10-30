@@ -5,6 +5,7 @@ engine never crashes — it must either load and scan, or reject cleanly.
 
     python test/parity/fuzz.py [iterations]      # FUZZ_SEED=<n> for another sequence
 """
+import copy
 import json
 import os
 import random
@@ -35,6 +36,11 @@ SCL = ['', '(', ')', ':=', 'END_IF', '(*', '#', '..', '1..', '#x', '"Data"', '%X
        '#x := 1' + ' + #x' * 400 + ';', 'IF TRUE' + ' AND #b' * 300 + ' THEN #x := 1; END_IF;']
 
 
+def junk(rnd):
+    # a fresh copy: a shared [] / {} could otherwise be mutated into itself (a cycle)
+    return copy.deepcopy(rnd.choice(JUNK))
+
+
 def mutate(node, rnd, depth=0):
     if isinstance(node, dict):
         for k in list(node.keys()):
@@ -42,14 +48,14 @@ def mutate(node, rnd, depth=0):
             if r < 0.04:
                 del node[k]
             elif r < 0.10:
-                node[k] = rnd.choice(JUNK)
+                node[k] = junk(rnd)
             else:
                 mutate(node[k], rnd, depth + 1)
     elif isinstance(node, list):
         for i in range(len(node)):
             r = rnd.random()
             if r < 0.04:
-                node[i] = rnd.choice(JUNK)
+                node[i] = junk(rnd)
             else:
                 mutate(node[i], rnd, depth + 1)
         if node and rnd.random() < 0.05:

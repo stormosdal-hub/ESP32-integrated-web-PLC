@@ -1552,6 +1552,116 @@
     }
   }
 
+  /* ---- system FB calls from the instruction pane (click, or drag & drop) ----
+   * Like TIA, a call comes with its instance: a multi-instance (Static) in an
+   * FB, else a member of the global DB "Instances_DB" (created when missing).
+   * The parameters are TIA-style placeholders (_bool_in_ …) to fill in. */
+  const lcs = (x) => String(x || '').toLowerCase();
+  function placeholder(f) {
+    const ty = f.t.k === 'variant' ? 'variant' : lcs(T.types.typeName(f.t));
+    return '_' + ty + '_' + (f.section === 'out' ? 'out' : f.section === 'inout' ? 'inout' : 'in') + '_';
+  }
+  function sysCallPlan(name) {
+    const def = T.types.SYSFB[String(name).toUpperCase()];
+    if (!def || !block) return null;
+    let target, declare;
+    if (block.type === 'FB') {
+      T.ensureInterface(block);
+      const taken = T.ifaceMembers(block).map((e) => lcs(e.member.name));
+      let nm = def.name + '_Instance';
+      for (let i = 1; taken.indexOf(lcs(nm)) >= 0; i++) nm = def.name + '_Instance_' + i;
+      target = '#' + nm;
+      declare = () => { block.iface.static.push(T.model.newMember(nm, def.name)); };
+    } else {
+      const blocks = T.project.blocks;
+      let db = blocks.find((b) => b.type === 'DB' && lcs(b.name) === 'instances_db');
+      const members = (db && db.members) || [];
+      let i = 1;
+      while (members.some((m) => lcs(m.name) === lcs(def.name + '_' + i))) i++;
+      const nm = def.name + '_' + i;
+      target = '"' + (db ? db.name : 'Instances_DB') + '".' + nm;
+      declare = () => {
+        if (!db) {
+          db = T.model.newBlock('DB', 'Instances_DB', T.nextBlockNumber('DB'), 'DB');
+          delete db.iface;
+          db.members = [];
+          db.startValues = {};
+          blocks.push(db);
+        }
+        (db.members = db.members || []).push(T.model.newMember(nm, def.name));
+      };
+    }
+    const params = def.t.fields.filter((f) => f.section === 'in' || f.section === 'inout' || f.section === 'out');
+    const text = (indent) => {
+      const pad = indent + ' '.repeat(target.length + 1);
+      return target + '(' + params.map((f, k) => (k ? pad : '') + f.name +
+        (f.section === 'out' ? ' => ' : ' := ') + placeholder(f)).join(',\n') + ');';
+    };
+    return { text, declare, target, name: def.name };
+  }
+  // the instance was declared: the interface panel / tree / DB views follow
+  function declared(plan) {
+    plan.declare();
+    T.bus.emit('iface:changed', block);
+    T.bus.emit('tree:changed');
+    const mount = host && host.parentNode && host.parentNode.querySelector('.tia-iface-mount');
+    if (mount && T.editors.iface) T.editors.iface.render(mount, block);
+    T.status('Inserted ' + plan.name + ' — instance ' + plan.target + '. Replace the _…_ placeholders with your operands.', 'info');
+  }
+  // indentation of the statement the line at lineStart belongs to (a call's
+  // parameter lines are indented past it): up while the line above goes on
+  function stmtIndent(v, lineStart) {
+    let ls = lineStart;
+    while (ls > 0) {
+      const ps = v.lastIndexOf('\n', ls - 2) + 1;
+      const prev = v.slice(ps, ls - 1).replace(/\/\/.*$/, '').trim();
+      if (!prev || /(;|\bTHEN|\bDO|\bELSE|\bOF|\bREPEAT|\bBEGIN|\*\))$/i.test(prev)) break;
+      ls = ps;
+    }
+    return /^[ \t]*/.exec(v.slice(ls))[0];
+  }
+  // the call text for the range [s, e): on lines of its own, indented to fit
+  function placeCall(plan, v, s, e) {
+    const lineStart = v.lastIndexOf('\n', s - 1) + 1;
+    let lineEnd = v.indexOf('\n', e);
+    if (lineEnd < 0) lineEnd = v.length;
+    const before = v.slice(lineStart, s), after = v.slice(e, lineEnd);
+    const own = before.trim() === '';
+    const indent = own ? before : stmtIndent(v, lineStart);
+    return (own ? '' : '\n' + indent) + plan.text(indent) + (after.trim() ? '\n' + indent : '');
+  }
+  function insertSysCall(name) {
+    const plan = sysCallPlan(name);
+    if (!plan || !taArea) return;
+    const s = taArea.selectionStart, e = taArea.selectionEnd;
+    taArea.focus();
+    taArea.setRangeText(placeCall(plan, taArea.value, s, e), s, e, 'end');
+    declared(plan);
+    onInput();
+  }
+  // a drag from the instruction pane: the browser drops the text at the
+  // mouse position; the drop declares the instance, and the 'input' that
+  // follows puts the call on its own line(s), indented like its neighbours
+  let dropPlan = null, fixPlan = null;
+  function fixDrop(e) {
+    if (e.inputType !== 'insertFromDrop' || !fixPlan) return;
+    const plan = fixPlan;
+    fixPlan = null;
+    const raw = plan.text('');
+    const v = taArea.value;
+    let s = taArea.selectionStart, en = taArea.selectionEnd;
+    if (v.slice(s, en) !== raw) {
+      s = v.lastIndexOf(raw, en);
+      if (s < 0) return;
+      en = s + raw.length;
+    }
+    taArea.setRangeText(placeCall(plan, v.slice(0, s) + v.slice(en), s, s), s, en, 'end');
+  }
+  function dragPlan(name) {
+    dropPlan = sysCallPlan(name);
+    return dropPlan ? dropPlan.text('') : '';
+  }
+
   function open(hostEl, blk) {
     host = hostEl; block = blk;
     if (block.code == null) block.code = '';
@@ -1574,9 +1684,19 @@
     wrap.appendChild(bar); wrap.appendChild(body); wrap.appendChild(statusEl);
     host.appendChild(wrap);
 
+    taArea.addEventListener('input', fixDrop);         // before onInput: it reads the fixed text
     taArea.addEventListener('input', onInput);
     taArea.addEventListener('keydown', onKeyDown);
     taArea.addEventListener('scroll', () => { gutter.scrollTop = taArea.scrollTop; });
+    taArea.addEventListener('drop', (e) => {
+      const types = Array.from((e.dataTransfer && e.dataTransfer.types) || []);
+      if (dropPlan && types.indexOf('text/tia-sysfb') >= 0) {
+        const plan = dropPlan;
+        dropPlan = null;
+        fixPlan = plan;
+        declared(plan);                   // the browser inserts the text and fires 'input'
+      }
+    });
 
     renderGutter(0);
     recompile();
@@ -1586,6 +1706,9 @@
       block: blk,
       // SCL has a single text body — these toolbar hooks are intentional no-ops.
       insert() {},
+      insertSysCall,                    // instruction pane: TCON, TON, … at the cursor
+      dragPlan,                         // … or dragged into the code
+      dragEnd() { setTimeout(() => { dropPlan = null; }, 0); },
       deleteSelection() {},
       addNetwork() { T.status('SCL blocks have one code body — no networks to add.', 'warn'); },
       refresh() { if (taArea) { taArea.value = block.code || ''; renderGutter(0); recompile(); } },

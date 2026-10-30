@@ -390,10 +390,23 @@ python tools/tcplink_client.py <PLC address> --set StartCmd=1 --set Setpoint=42
 
 ## Open User Communication (TCP)
 
-`TCON`, `TDISCON`, `TSEND` and `TRCV` work as on an S7-1200 (as system FBs in SCL:
-`#conn(REQ := ..., ID := 1, CONNECT := #param, ...)` with a `TCON_IP_v4` parameter
-block), with S7 `STATUS` codes (`7000`/`7001`/`7002`, `80A1`, `80A3`, `80A4`, `80A7`,
-`80B3`, `80B6`, `80C4`, `8088` …):
+`TCON`, `TDISCON`, `TSEND` and `TRCV` work as on an S7-1200, with S7 `STATUS` codes
+(`7000`/`7001`/`7002`, `80A1`, `80A3`, `80A4`, `80A7`, `80B3`, `80B6`, `80C4`, `8088` …).
+They are in the *Instructions* pane under **Communication**:
+
+- **LAD / FBD**: drag one onto a network (or click it to insert). `REQ` / `EN_R` is the
+  rung power in LAD (an input pin in FBD); click the operands next to the other pins:
+  `ID` and `LEN` take a number or a tag, `CONNECT` a `TCON_IP_v4` parameter block
+  (e.g. `"Conn".server`, or `#param` in an FB), `DATA` what to send / where to receive
+  (a DB member or path, a whole DB, or a tag), the outputs (`DONE`, `BUSY`, `ERROR`,
+  `STATUS`, `NDR`, `RCVD_LEN`) any tag or member — or wire them on in FBD. Each box
+  keeps its own instance.
+- **SCL**: click one to insert the call at the cursor, or drag it into the code. Like
+  TIA, the instance is declared for you — a multi-instance (`#TCON_Instance`) in an FB,
+  otherwise a member of the global DB `"Instances_DB"` — and the parameters are
+  placeholders (`_bool_in_` …) to replace:
+  `#conn(REQ := ..., ID := 1, CONNECT := #param, ...)`. Timers, counters and
+  `R_TRIG` / `F_TRIG` are there too.
 
 - **passive** (`ActiveEstablished := FALSE`): listens on `LocalPort` and accepts one
   client; **active**: connects to `RemoteAddress:RemotePort`, retried about every second
