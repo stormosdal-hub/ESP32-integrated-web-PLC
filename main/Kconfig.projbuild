@@ -1,0 +1,183 @@
+menu "ESP32 Web PLC"
+
+    menu "Wi-Fi"
+        config PLC_WIFI_SSID
+            string "Wi-Fi network (SSID) to join"
+            default ""
+            help
+                Network the PLC joins at power-up. Leave empty to start only the
+                setup access point. Credentials saved from the web UI
+                (ESP32 tab -> Device -> Wi-Fi) are stored in NVS and take
+                precedence over this value.
+
+        config PLC_WIFI_PASSWORD
+            string "Wi-Fi password"
+            default ""
+
+        config PLC_AP_SSID
+            string "Setup access point name"
+            default "ESP32-PLC"
+            help
+                Started when no network is configured or the configured one
+                cannot be joined. "-XXXX" (last MAC bytes) is appended.
+                The IDE is then at http://192.168.4.1
+
+        config PLC_AP_PASSWORD
+            string "Setup access point password (8+ chars, empty = open)"
+            default "plc12345"
+
+        config PLC_AP_FALLBACK_SEC
+            int "Open the setup access point after this many seconds without Wi-Fi"
+            range 5 300
+            default 20
+
+        config PLC_HOSTNAME
+            string "Hostname (reachable as <hostname>.local)"
+            default "esp32-plc"
+
+        config PLC_WIFI_MAX_TX_POWER
+            int "Maximum Wi-Fi transmit power (dBm)"
+            range 2 20
+            default 20
+            help
+                20 = the chip's full power. Some boards (poor antenna design,
+                weak USB supply) only get through at reduced power: when the
+                PLC sees your router but "the router did not answer", and its
+                setup access point is invisible, try 11 or 8.
+    endmenu
+
+    menu "PLC runtime"
+        config PLC_MAX_PROGRAM_KB
+            int "Largest accepted program download (KB)"
+            range 16 504
+            default 256
+            help
+                Projects are stored as JSON in flash. Typical projects are
+                5-60 KB. While compiling, a small project needs 30-50 KB of
+                heap; large ones about 2.5-3x their JSON size (more when many
+                FB instances are called, each instance is compiled on its own).
+                The JSON text itself is read straight from flash. Device > Heap
+                in the IDE shows what is free; very large projects need a board
+                with PSRAM enabled.
+
+        config PLC_AUTORUN
+            bool "Run the stored program after power-up (if it was in RUN)"
+            default y
+
+        config PLC_SCAN_TASK_CORE
+            int "CPU core for the scan task"
+            range 0 0 if FREERTOS_UNICORE || SOC_CPU_CORES_NUM = 1
+            range 0 1
+            default 0 if FREERTOS_UNICORE || SOC_CPU_CORES_NUM = 1
+            default 1
+            help
+                Wi-Fi and the web server run on core 0, so the PLC scan gets
+                core 1 to itself by default. Single-core chips (ESP32-C3,
+                ESP32-C6) only have core 0.
+
+        config PLC_SCAN_TASK_PRIORITY
+            int "Scan task priority"
+            range 2 22
+            default 10
+
+        choice PLC_PSRAM_PINS
+            prompt "Pins wired to PSRAM (S3: GPIO33-37, ESP32: GPIO16-17)"
+            depends on IDF_TARGET_ESP32 || IDF_TARGET_ESP32S3
+            default PLC_PSRAM_PINS_AUTO
+            help
+                ESP32-S3 modules with octal PSRAM (N8R8, N16R8 ...) use
+                GPIO33-37 for it; the S3 tells from its eFuse.
+                Classic ESP32 WROVER modules use GPIO16-17 for PSRAM; the
+                firmware only knows when PSRAM is enabled in menuconfig
+                (Component config > ESP PSRAM). Until then these pins are
+                usable with a warning. Pins reserved here cannot be mapped
+                to PLC tags.
+            config PLC_PSRAM_PINS_AUTO
+                bool "Detect (recommended)"
+            config PLC_PSRAM_PINS_RESERVED
+                bool "Always reserved"
+            config PLC_PSRAM_PINS_FREE
+                bool "Always usable"
+        endchoice
+    endmenu
+
+    menu "ESP32-P4 board"
+        depends on IDF_TARGET_ESP32P4
+
+        choice PLC_P4_BOARD
+            prompt "Board"
+            default PLC_P4_BOARD_WS_NANO
+            help
+                Tells the PLC which pins the board already uses (the SDIO link
+                to the ESP32-C6, Ethernet, SD card, audio ...) so they can't be
+                mapped to tags, and which header the IDE draws. The SDIO pins
+                themselves are set in Component config > ESP-Hosted.
+            config PLC_P4_BOARD_WS_NANO
+                bool "Waveshare ESP32-P4-NANO"
+            config PLC_P4_BOARD_WS_MODULE
+                bool "Waveshare ESP32-P4-Module-DEV-KIT"
+            config PLC_P4_BOARD_WS_WIFI6
+                bool "Waveshare ESP32-P4-WIFI6 (Pico size, with ESP32-C6)"
+            config PLC_P4_BOARD_GENERIC
+                bool "Other ESP32-P4 + ESP32-C6 board (chip-level pin rules only)"
+        endchoice
+    endmenu
+
+    menu "Modbus TCP server"
+        config PLC_MODBUS_ENABLE
+            bool "Serve the I/Q/M memory over Modbus TCP"
+            default y
+
+        config PLC_MODBUS_PORT
+            int "Modbus TCP port"
+            depends on PLC_MODBUS_ENABLE
+            default 502
+
+        config PLC_MODBUS_MAX_CLIENTS
+            int "Concurrent Modbus clients"
+            depends on PLC_MODBUS_ENABLE
+            range 1 4
+            default 2
+    endmenu
+
+    menu "Status LED"
+        choice PLC_STATUS_LED
+            prompt "Status LED type"
+            default PLC_STATUS_LED_GPIO if IDF_TARGET_ESP32 || IDF_TARGET_ESP32C3
+            default PLC_STATUS_LED_NONE if IDF_TARGET_ESP32P4
+            default PLC_STATUS_LED_WS2812
+            help
+                RUN = green, STOP = orange, forced I/O = blinking,
+                no program = blue, Wi-Fi setup mode = purple.
+            config PLC_STATUS_LED_NONE
+                bool "None"
+            config PLC_STATUS_LED_WS2812
+                bool "WS2812 RGB LED (ESP32-S3-DevKitC-1 on-board LED)"
+            config PLC_STATUS_LED_GPIO
+                bool "Plain LED on a GPIO (on = RUN, blinking = STOP)"
+        endchoice
+
+        config PLC_STATUS_LED_PIN
+            int "Status LED GPIO"
+            depends on !PLC_STATUS_LED_NONE
+            range 0 54
+            default 2 if IDF_TARGET_ESP32
+            default 8 if IDF_TARGET_ESP32C3 || IDF_TARGET_ESP32C6
+            default 48
+            help
+                ESP32-S3-DevKitC-1 v1.0: GPIO48 (RGB), v1.1: GPIO38 (RGB).
+                ESP32-C6-DevKitC-1: GPIO8 (RGB). ESP32-C3 SuperMini: GPIO8
+                (blue, active-low; the SuperMini "Plus" has an RGB LED there).
+                ESP32 DevKit boards with a blue LED (DOIT DevKit V1 and most
+                30-pin clones): GPIO2. Espressif's ESP32-DevKitC has no user
+                LED: choose "None" there. This pin is then reserved and cannot
+                be mapped to a PLC tag.
+
+        config PLC_STATUS_LED_ACTIVE_LOW
+            bool "Plain LED is active-low"
+            depends on PLC_STATUS_LED_GPIO
+            default y if IDF_TARGET_ESP32C3
+            default n
+    endmenu
+
+endmenu

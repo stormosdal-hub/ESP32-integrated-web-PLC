@@ -1,0 +1,4 @@
+# ESP32-C6 (drawn as the ESP32-C6-DevKitC-1). Added on top of sdkconfig.defaults
+# when building with:  tools/idf.ps1 -Chip esp32c6 ...
+# Console on UART0 (GPIO16/17, the DevKitC-1's "UART" port) plus the chip's own
+# USB port (GPIO12/13) as second console. Status LED: the RGB LED on GPIO8.

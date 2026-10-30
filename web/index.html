@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TIA Web PLC — ESP32</title>
+  <link rel="stylesheet" href="css/tia.css" />
+</head>
+<body>
+  <!-- ====================== Title / menu bar ====================== -->
+  <header id="tia-titlebar">
+    <div class="tia-title-left">
+      <span class="tia-logo">TIA</span>
+      <span class="tia-title-text">Totally Integrated Automation Portal — Web PLC · ESP32</span>
+    </div>
+    <div class="tia-menu" id="tia-menu"></div>
+    <div class="tia-title-right">
+      <span id="tia-project-name">PLC_Project</span>
+    </div>
+  </header>
+
+  <!-- ====================== Ribbon toolbar ====================== -->
+  <div id="tia-toolbar"></div>
+
+  <!-- ====================== Main work area ====================== -->
+  <div id="tia-main">
+    <!-- left: project tree -->
+    <aside id="tia-tree-panel" class="tia-panel">
+      <div class="tia-panel-head tia-lpanel-head">
+        <span class="tia-lpanel-tab active" data-lp="tree">Project tree</span>
+        <span class="tia-lpanel-tab" data-lp="tags">Tags</span>
+      </div>
+      <div id="tia-tree" class="tia-panel-body" data-lp-panel="tree"></div>
+      <div id="tia-outline" class="tia-panel-body" data-lp-panel="tags" style="display:none"></div>
+      <div class="tia-splitter-h" data-target="tia-details"></div>
+      <div id="tia-details" class="tia-details-pane"></div>
+    </aside>
+
+    <div class="tia-splitter" data-target="tia-tree-panel"></div>
+
+    <!-- center: tabbed editor -->
+    <section id="tia-center">
+      <div id="tia-tabs"></div>
+      <div id="tia-editor" class="tia-editor-host"></div>
+      <div class="tia-splitter-h" data-target="tia-inspector-panel"></div>
+      <!-- bottom: inspector / simulation / output -->
+      <div id="tia-inspector-panel">
+        <div id="tia-inspector-tabs" class="tia-itabs"></div>
+        <div id="tia-inspector" class="tia-inspector-body"></div>
+      </div>
+    </section>
+
+    <div class="tia-splitter" data-target="tia-task-panel"></div>
+
+    <!-- right: instruction tree (task card) -->
+    <aside id="tia-task-panel" class="tia-panel">
+      <div class="tia-panel-head"><span>Instructions</span></div>
+      <div id="tia-instructions" class="tia-panel-body"></div>
+    </aside>
+  </div>
+
+  <!-- ====================== Status bar ====================== -->
+  <footer id="tia-statusbar">
+    <span id="tia-status-msg">Ready</span>
+    <span class="tia-status-spacer"></span>
+    <span id="tia-status-sim" class="tia-status-pill tia-pill-stop">● STOP</span>
+    <span id="tia-status-force" class="tia-status-pill tia-pill-force" style="display:none" title="I/O is forced — click to stop forcing">F</span>
+    <span id="tia-status-cpu" class="tia-status-pill tia-pill-stop" style="display:none"></span>
+    <span id="tia-status-online" class="tia-status-pill tia-pill-stop" style="display:none"></span>
+    <span id="tia-status-scan"></span>
+  </footer>
+
+  <!-- ====================== Scripts (classic, ordered) ====================== -->
+  <!-- core MUST load first; app.js MUST load last. Feature modules only call
+       each other at runtime, so their relative order does not matter. -->
+  <script src="js/core.js"></script>
+  <script src="js/tags.js"></script>
+  <script src="js/tree.js"></script>
+  <script src="js/instructions.js"></script>
+  <script src="js/iface.js"></script>
+  <script src="js/outline.js"></script>
+  <script src="js/details.js"></script>
+  <script src="js/lad.js"></script>
+  <script src="js/fbd.js"></script>
+  <script src="js/scl.js"></script>
+  <script src="js/sim.js"></script>
+  <script src="js/esp32.js"></script>
+  <script src="js/online.js"></script>
+  <script src="js/toolbar.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

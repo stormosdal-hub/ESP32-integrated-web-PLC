@@ -1,0 +1,17 @@
+dependencies:
+  idf: ">=5.1"
+  # <hostname>.local name resolution (moved out of ESP-IDF in v5.0)
+  espressif/mdns: "^1.4.0"
+  # ESP32-P4 only: the P4 has no radio of its own. esp_wifi_remote provides the
+  # usual esp_wifi_* API and esp_hosted carries it over SDIO to the ESP32-C6 on
+  # the board, which runs Espressif's esp_hosted slave firmware. The host side
+  # must suit that firmware: these are the versions already proven with these
+  # Waveshare P4 boards and ESP-IDF 5.5.1 (3.x is a new major version, untried).
+  espressif/esp_wifi_remote:
+    version: "~1.6.5"
+    rules:
+      - if: "target in [esp32p4]"
+  espressif/esp_hosted:
+    version: "~2.12.13"
+    rules:
+      - if: "target in [esp32p4]"

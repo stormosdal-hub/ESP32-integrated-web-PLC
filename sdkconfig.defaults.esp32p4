@@ -1,0 +1,13 @@
+# ESP32-P4 boards with an ESP32-C6 for Wi-Fi (Waveshare ESP32-P4-NANO,
+# ESP32-P4-Module-DEV-KIT, ESP32-P4-Pico). Added on top of sdkconfig.defaults
+# when building with:  tools/idf.ps1 -Chip esp32p4 ...
+# Pick the board in menuconfig -> ESP32 Web PLC -> ESP32-P4 board.
+
+# Wi-Fi through the C6 (esp_hosted slave firmware) over SDIO. esp_hosted's own
+# P4 defaults (slot 1, 4-bit, CLK 18, CMD 19, D0-D3 = GPIO14-17, C6 reset =
+# GPIO54) match these boards.
+CONFIG_ESP_HOSTED_CP_TARGET_ESP32C6=y
+CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
+
+# the in-package PSRAM: room for large programs
+CONFIG_SPIRAM=y

@@ -1,0 +1,9 @@
+# Build-test variant D (classic ESP32, tools/build_all.ps1): WROVER-style module
+# with PSRAM (GPIO16/17 reserved when found), WS2812 status LED on GPIO18,
+# single-core FreeRTOS (scan task on core 0), Modbus off.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+CONFIG_PLC_STATUS_LED_WS2812=y
+CONFIG_PLC_STATUS_LED_PIN=18
+CONFIG_FREERTOS_UNICORE=y
+# CONFIG_PLC_MODBUS_ENABLE is not set

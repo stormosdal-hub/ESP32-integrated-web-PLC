@@ -1,0 +1,31 @@
+# ---- target / flash -------------------------------------------------------
+# Settings shared by every chip. The chip-specific extras are in
+# sdkconfig.defaults.<chip> (ESP-IDF adds the matching one automatically).
+# The ESP32-S3 is the default chip (sdkconfig + build/); other chips build
+# side by side:  tools/idf.ps1 -Chip esp32 build  (sdkconfig.esp32 + build_esp32/)
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# ---- 1 ms RTOS tick: scan cycles down to 1 ms -----------------------------
+CONFIG_FREERTOS_HZ=1000
+
+# ---- HTTP server: room for the API routes and a project upload ------------
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+CONFIG_HTTPD_MAX_URI_LEN=512
+CONFIG_LWIP_MAX_SOCKETS=20
+
+# ---- the scan task and the web server run on different cores --------------
+CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0=y
+# app_main compiles the stored program at boot (the stack is freed afterwards)
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# ---- console stays on UART0 (S3: GPIO43/44, the "UART" USB port on DevKitC;
+# ESP32: GPIO1/3, the board's USB-UART chip) ---------------------------------
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+
+# ---- PSRAM is optional. If your module has it (S3: N8R2 = quad, N8R8/N16R8 =
+# octal; ESP32: WROVER) enable it in menuconfig -> Component config -> ESP
+# PSRAM; the firmware then keeps large programs in PSRAM automatically.

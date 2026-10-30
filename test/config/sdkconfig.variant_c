@@ -1,0 +1,2 @@
+# variant C: no status LED at all
+CONFIG_PLC_STATUS_LED_NONE=y

@@ -1,0 +1,9 @@
+# Classic ESP32 (ESP32-WROOM-32 / WROVER DevKits). Added on top of
+# sdkconfig.defaults when building with:  tools/idf.ps1 -Chip esp32 ...
+
+# full speed (the ESP32 starts at 160 MHz otherwise): shorter scan cycles
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# The status LED defaults to a plain LED on GPIO2 (DOIT DevKit V1 and most
+# 30-pin boards). Espressif's ESP32-DevKitC has no user LED: set
+# menuconfig -> ESP32 Web PLC -> Status LED -> None there.

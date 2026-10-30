@@ -1,0 +1,11 @@
+# ESP32-C3 (drawn as the ESP32-C3 SuperMini). Added on top of sdkconfig.defaults
+# when building with:  tools/idf.ps1 -Chip esp32c3 ...
+
+# The SuperMini's only USB port is the chip's own USB (Serial/JTAG): logs go
+# there, which also frees UART0 (GPIO20/21) for I/O.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# The SuperMini's small antenna / regulator often can't take full Wi-Fi power:
+# 9 dBm here becomes the radio's 8.5 dBm step, the widely reported fix. Raise it
+# in menuconfig (ESP32 Web PLC > Wi-Fi) on a board that copes.
+CONFIG_PLC_WIFI_MAX_TX_POWER=9

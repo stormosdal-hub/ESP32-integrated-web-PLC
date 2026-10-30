@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "plc-emulator",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["tools/plc_emulator.py", "--port", "8080"],
+      "port": 8080
+    },
+    {
+      "name": "plc-emulator-esp32",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["tools/plc_emulator.py", "--chip", "esp32", "--port", "8081"],
+      "port": 8081
+    },
+    {
+      "name": "plc-emulator-p4-nano",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["tools/plc_emulator.py", "--chip", "esp32p4", "--board", "nano", "--port", "8082"],
+      "port": 8082
+    }
+  ]
+}

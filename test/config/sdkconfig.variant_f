@@ -1,0 +1,7 @@
+# Build-test variant F (ESP32-P4, tools/build_all.ps1): "other board" (chip-level
+# pin rules only, no LDO VO4 change) with a WS2812 status LED on GPIO20 (RMT on
+# the P4) and Modbus off.
+CONFIG_PLC_P4_BOARD_GENERIC=y
+CONFIG_PLC_STATUS_LED_WS2812=y
+CONFIG_PLC_STATUS_LED_PIN=20
+# CONFIG_PLC_MODBUS_ENABLE is not set

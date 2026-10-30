@@ -1,0 +1,205 @@
+/* ===========================================================================
+ * TIA-like Browser PLC IDE  —  tia.css
+ * Theme variables + application shell chrome.
+ * Feature modules inject their own component CSS but reference these vars.
+ * Visual target: Siemens TIA Portal v15+ (petrol/teal accent, light-grey UI).
+ * =========================================================================*/
+:root {
+  /* Siemens petrol/teal accent family */
+  --tia-petrol:      #009999;
+  --tia-petrol-dark: #00736e;
+  --tia-petrol-deep: #14424b;
+  --tia-accent:      #009999;
+
+  /* greys */
+  --tia-bg:          #d9dde1;   /* app background */
+  --tia-panel:       #f4f5f6;   /* panel body */
+  --tia-panel-head:  #6e7b86;   /* panel header bar */
+  --tia-titlebar:    #2f3b44;   /* top title bar */
+  --tia-toolbar:     #e9ecee;
+  --tia-border:      #b6bcc2;
+  --tia-border-soft: #d2d6da;
+  --tia-row-alt:     #eef0f2;
+  --tia-hover:       #d8eef0;
+  --tia-select:      #b6e2e4;
+  --tia-select-bd:   #009999;
+
+  /* text */
+  --tia-text:        #1f2a30;
+  --tia-text-soft:   #5b6770;
+  --tia-text-inv:    #ffffff;
+
+  /* editor / ladder */
+  --tia-canvas:      #ffffff;
+  --tia-rail:        #1f6f73;   /* ladder rails / wires */
+  --tia-wire:        #2a2f33;
+  --tia-live:        #00b050;   /* energized power flow (green) */
+  --tia-live-bg:     #e3f7e8;
+  --tia-low:         #1f74e0;   /* de-energized power flow during simulation (blue) */
+  --tia-net-head:    #eef1f3;
+
+  --tia-font: "Segoe UI", Tahoma, "DejaVu Sans", Arial, sans-serif;
+  --tia-mono: "Consolas", "DejaVu Sans Mono", monospace;
+  --tia-fs: 12.5px;
+
+  --tia-tree-w: 260px;
+  --tia-task-w: 270px;
+  --tia-inspector-h: 200px;
+}
+
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; padding: 0; height: 100%; overflow: hidden;
+  font-family: var(--tia-font); font-size: var(--tia-fs); color: var(--tia-text);
+  background: var(--tia-bg); user-select: none;
+}
+body { display: flex; flex-direction: column; height: 100vh; }
+button { font-family: inherit; font-size: inherit; }
+
+/* ----------------------------------------------------------- title bar */
+#tia-titlebar {
+  height: 30px; flex: 0 0 30px; display: flex; align-items: center;
+  background: linear-gradient(#3a4750, var(--tia-titlebar));
+  color: var(--tia-text-inv); padding: 0 10px; gap: 14px;
+}
+.tia-title-left { display: flex; align-items: center; gap: 8px; }
+.tia-logo {
+  background: var(--tia-petrol); color: #fff; font-weight: 700; letter-spacing: .5px;
+  padding: 2px 7px; border-radius: 2px; font-size: 12px;
+}
+.tia-title-text { font-size: 12px; opacity: .92; }
+.tia-menu { display: flex; gap: 2px; margin-left: 10px; }
+.tia-menu .tia-menu-item { padding: 4px 9px; cursor: pointer; border-radius: 2px; font-size: 12px; }
+.tia-menu .tia-menu-item:hover { background: rgba(255,255,255,.14); }
+.tia-title-right { margin-left: auto; font-size: 12px; opacity: .85; }
+
+/* ----------------------------------------------------------- ribbon toolbar */
+#tia-toolbar {
+  flex: 0 0 auto; background: var(--tia-toolbar);
+  border-bottom: 1px solid var(--tia-border);
+  display: flex; align-items: stretch; gap: 0; padding: 4px 6px; min-height: 46px;
+}
+.tia-tb-group { display: flex; flex-direction: column; align-items: center;
+  padding: 0 8px; border-right: 1px solid var(--tia-border-soft); }
+.tia-tb-group:last-child { border-right: none; }
+.tia-tb-row { display: flex; gap: 3px; align-items: center; }
+.tia-tb-label { font-size: 10px; color: var(--tia-text-soft); margin-top: 2px; }
+.tia-tb-btn {
+  display: inline-flex; align-items: center; gap: 5px; height: 26px; padding: 0 9px;
+  background: #fbfcfc; border: 1px solid var(--tia-border); border-radius: 3px;
+  color: var(--tia-text); cursor: pointer; white-space: nowrap;
+}
+.tia-tb-btn:hover { background: var(--tia-hover); border-color: var(--tia-petrol); }
+.tia-tb-btn:active { background: var(--tia-select); }
+.tia-tb-btn[disabled] { opacity: .45; cursor: default; }
+.tia-tb-btn svg { width: 15px; height: 15px; }
+.tia-tb-btn.primary { background: var(--tia-petrol); color: #fff; border-color: var(--tia-petrol-dark); }
+.tia-tb-btn.primary:hover { background: var(--tia-petrol-dark); }
+.tia-tb-btn.danger:hover { background: #f6d9d9; border-color: #c0392b; }
+
+/* ----------------------------------------------------------- main layout */
+#tia-main { flex: 1 1 auto; display: flex; min-height: 0; background: var(--tia-bg); }
+.tia-panel { display: flex; flex-direction: column; background: var(--tia-panel);
+  border: 1px solid var(--tia-border); min-width: 120px; }
+#tia-tree-panel { width: var(--tia-tree-w); flex: 0 0 var(--tia-tree-w); }
+#tia-task-panel { width: var(--tia-task-w); flex: 0 0 var(--tia-task-w); }
+.tia-panel-head {
+  height: 24px; flex: 0 0 24px; display: flex; align-items: center; padding: 0 8px;
+  background: var(--tia-panel-head); color: #fff; font-weight: 600; font-size: 11.5px;
+}
+.tia-panel-body { flex: 1 1 auto; overflow: auto; }
+
+/* left-panel tabs (Project tree / Tags) */
+.tia-lpanel-head { padding: 0; gap: 0; }
+.tia-lpanel-tab { height: 24px; padding: 0 11px; display: inline-flex; align-items: center;
+  cursor: pointer; font-weight: 600; font-size: 11.5px; color: rgba(255,255,255,.66);
+  border-right: 1px solid rgba(255,255,255,.12); }
+.tia-lpanel-tab:hover { color: #fff; background: rgba(255,255,255,.08); }
+.tia-lpanel-tab.active { color: #fff; background: rgba(255,255,255,.12);
+  box-shadow: 0 -2px 0 var(--tia-petrol) inset; }
+
+#tia-center { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0;
+  border-top: 1px solid var(--tia-border); border-bottom: 1px solid var(--tia-border); }
+
+/* tabs */
+#tia-tabs { flex: 0 0 28px; display: flex; align-items: flex-end; gap: 2px;
+  background: var(--tia-bg); padding: 0 4px; overflow-x: auto; }
+.tia-tab { display: flex; align-items: center; gap: 6px; height: 24px; padding: 0 10px;
+  background: #e3e6e9; border: 1px solid var(--tia-border); border-bottom: none;
+  border-radius: 4px 4px 0 0; cursor: pointer; color: var(--tia-text-soft); white-space: nowrap; }
+.tia-tab.active { background: var(--tia-canvas); color: var(--tia-text); font-weight: 600;
+  box-shadow: 0 -2px 0 var(--tia-petrol) inset; }
+.tia-tab .tia-tab-close { opacity: .5; padding: 0 2px; }
+.tia-tab .tia-tab-close:hover { opacity: 1; color: #c0392b; }
+
+.tia-editor-host { flex: 1 1 auto; overflow: auto; background: var(--tia-canvas);
+  position: relative; }
+
+/* inspector / bottom dock */
+#tia-inspector-panel { flex: 0 0 var(--tia-inspector-h); height: var(--tia-inspector-h);
+  display: flex; flex-direction: column; background: var(--tia-panel);
+  border-top: 1px solid var(--tia-border); }
+.tia-itabs { flex: 0 0 24px; display: flex; gap: 2px; padding: 2px 4px 0;
+  background: var(--tia-toolbar); border-bottom: 1px solid var(--tia-border); }
+.tia-itab { padding: 3px 12px; cursor: pointer; border: 1px solid transparent;
+  border-bottom: none; border-radius: 4px 4px 0 0; color: var(--tia-text-soft); }
+.tia-itab.active { background: var(--tia-panel); color: var(--tia-text); font-weight: 600;
+  border-color: var(--tia-border); }
+.tia-inspector-body { flex: 1 1 auto; overflow: auto; padding: 6px 8px; }
+
+/* ----------------------------------------------------------- splitters */
+.tia-splitter { flex: 0 0 4px; cursor: col-resize; background: transparent; }
+.tia-splitter:hover { background: var(--tia-petrol); }
+.tia-splitter-h { flex: 0 0 4px; cursor: row-resize; background: transparent; }
+.tia-splitter-h:hover { background: var(--tia-petrol); }
+
+/* ----------------------------------------------------------- status bar */
+#tia-statusbar {
+  flex: 0 0 22px; height: 22px; display: flex; align-items: center; gap: 12px;
+  background: var(--tia-titlebar); color: #cdd5da; padding: 0 10px; font-size: 11px;
+}
+.tia-status-spacer { flex: 1 1 auto; }
+.tia-status-pill { padding: 1px 8px; border-radius: 10px; font-weight: 600; }
+.tia-pill-run { background: var(--tia-live); color: #fff; }
+.tia-pill-stop { background: #7a6a3a; color: #fff; }
+
+/* ----------------------------------------------------------- generic widgets */
+.tia-tree-node { display: flex; align-items: center; gap: 5px; padding: 2px 6px;
+  cursor: pointer; white-space: nowrap; }
+.tia-tree-node:hover { background: var(--tia-hover); }
+.tia-tree-node.selected { background: var(--tia-select); outline: 1px solid var(--tia-select-bd); }
+.tia-tree-node .tia-twisty { width: 12px; display: inline-flex; justify-content: center;
+  color: var(--tia-text-soft); transition: transform .1s; }
+.tia-tree-node .tia-twisty.open { transform: rotate(90deg); }
+.tia-tree-icon { width: 16px; height: 16px; color: var(--tia-petrol-dark); display: inline-flex; }
+.tia-tree-children { /* indent handled inline */ }
+
+.tia-input { font-family: inherit; font-size: inherit; padding: 2px 5px;
+  border: 1px solid var(--tia-border); border-radius: 2px; background: #fff; color: var(--tia-text); }
+.tia-input:focus { outline: none; border-color: var(--tia-petrol); box-shadow: 0 0 0 2px rgba(0,153,153,.18); }
+select.tia-input { background: #fff; }
+
+table.tia-table { border-collapse: collapse; width: 100%; font-size: 12px; }
+table.tia-table th { background: var(--tia-panel-head); color: #fff; font-weight: 600;
+  text-align: left; padding: 3px 7px; position: sticky; top: 0; }
+table.tia-table td { border: 1px solid var(--tia-border-soft); padding: 1px 5px; }
+table.tia-table tr:nth-child(even) td { background: var(--tia-row-alt); }
+table.tia-table tr.selected td { background: var(--tia-select); }
+
+/* scrollbars (webkit) */
+::-webkit-scrollbar { width: 12px; height: 12px; }
+::-webkit-scrollbar-thumb { background: #b9c0c6; border-radius: 6px; border: 3px solid var(--tia-panel); }
+::-webkit-scrollbar-thumb:hover { background: var(--tia-petrol); }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* operand autocomplete dropdown (IntelliSense-style) */
+.tia-ac { position: fixed; z-index: 9500; background: #fff; border: 1px solid var(--tia-border);
+  box-shadow: 0 6px 18px rgba(0,0,0,.20); border-radius: 3px; max-height: 240px; overflow: auto;
+  font-size: 12px; padding: 2px 0; }
+.tia-ac-item { display: flex; align-items: baseline; gap: 10px; padding: 3px 10px; cursor: pointer; white-space: nowrap; }
+.tia-ac-item.hi, .tia-ac-item:hover { background: var(--tia-select); }
+.tia-ac-name { font-weight: 600; color: var(--tia-text); }
+.tia-ac-hint { margin-left: auto; color: var(--tia-text-soft); font-family: var(--tia-mono); font-size: 11px; }
+
+.tia-muted { color: var(--tia-text-soft); }
+.tia-empty { padding: 20px; color: var(--tia-text-soft); text-align: center; font-style: italic; }
