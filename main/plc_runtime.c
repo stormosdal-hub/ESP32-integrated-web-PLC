@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
+#include <time.h>
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -12,6 +14,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs.h"
+#include "ouc_esp.h"
 #include "plc_io_esp.h"
 #include "plc_store.h"
 #include "sdkconfig.h"
@@ -39,6 +42,34 @@ static void *env_alloc_big(size_t n)
     return heap_caps_malloc_prefer(n, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 }
 static void env_free(void *p) { heap_caps_free(p); }
+
+/* days since 1970-01-01 of a proleptic Gregorian date (a timegm() without
+ * the library: newlib has none) */
+static int64_t days_from_civil(int64_t y, int m, int d)
+{
+    y -= m <= 2;
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    int64_t yoe = y - era * 400;
+    int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/* RD_SYS_T / RD_LOC_T: the system clock (set by SNTP, see wifi_mgr.c) in ms
+ * since 1970 — UTC, or the same instant as local wall time (CONFIG_PLC_TIMEZONE) */
+static double env_wall(void *u, bool local)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    double ms = (double)tv.tv_usec / 1000.0;
+    if (!local) return (double)tv.tv_sec * 1000.0 + ms;
+    time_t t = tv.tv_sec;
+    struct tm lt;
+    localtime_r(&t, &lt);
+    int64_t s = days_from_civil(lt.tm_year + 1900LL, lt.tm_mon + 1, lt.tm_mday) * 86400 + lt.tm_hour * 3600 +
+                lt.tm_min * 60 + lt.tm_sec;
+    return (double)s * 1000.0 + ms;
+}
 
 /* ---------------------------------------------------------- lock */
 void plc_rt_lock(void) { xSemaphoreTake(s_lock, portMAX_DELAY); }
@@ -170,6 +201,17 @@ esp_err_t plc_rt_init(void)
     s_env.alloc = env_alloc;
     s_env.alloc_big = env_alloc_big;
     s_env.free = env_free;
+    s_env.wall_ms = env_wall;
+    s_env.net = ouc_esp_net(); /* NULL (ouc_esp_init failed): the engine's virtual network */
+    /* every task that enters the engine has a 16 KB stack (main task, httpd,
+     * scan task): the engine may use 10 KB below its entry point, leaving the
+     * rest for the frames above it and the deepest leaf calls (printf). A
+     * program nested deeper fails to compile / has the call skipped instead
+     * of overflowing the stack (and boot-looping on the stored program). */
+    s_env.stack_limit = 10 * 1024;
+    if (!s_env.net) ESP_LOGE(TAG, "no TCP for TCON/TSEND/TRCV - they only reach the program's own connections");
+    setenv("TZ", CONFIG_PLC_TIMEZONE, 1); /* RD_LOC_T */
+    tzset();
     stats_reset();
 
     char err[200] = "";
@@ -269,7 +311,10 @@ bool plc_rt_set_running(bool run)
     plc_rt_lock();
     bool was = s_running;
     s_running = run && s_has_program;
-    if (was && !s_running) plc_io_outputs_off(s_eng); /* real PLC STOP: de-energize */
+    if (was && !s_running) {
+        plc_io_outputs_off(s_eng); /* real PLC STOP: de-energize */
+        plc_comm_reset(s_eng);     /* ... and drop the TCP connections (TCON again on RUN) */
+    }
     if (!was && s_running) stats_reset();
     bool now = s_running;
     plc_rt_unlock();

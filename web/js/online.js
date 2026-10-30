@@ -6,9 +6,11 @@
  * Only active when the IDE is SERVED by the PLC (http/https), so same-origin
  * fetch to /api/* works. Opened from a file, the IDE works offline (simulator).
  *
- * PLC API:  GET  /api/info  /api/state  /api/program  /api/pins  /api/netinfo
+ * PLC API:  GET  /api/info  /api/state[?dbs=A,B]  /api/program  /api/pins  /api/netinfo
  *           POST /api/program  /api/force {key,value}  /api/unforce
  *                /api/run  /api/stop
+ * The external source files (project.sources) are not downloaded: like in
+ * TIA they belong to the project, not to the PLC.
  * ==========================================================================*/
 (function (T) {
   'use strict';
@@ -138,7 +140,10 @@
     return go.then((ok) => {
       if (!ok) return false;
       T.status('Downloading to the PLC…');
-      const body = JSON.stringify(T.project, T.stripRuntime);
+      const body = JSON.stringify(T.project, function (k, v) {
+        if (this === T.project && k === 'sources') return undefined;   // project-only, not for the PLC
+        return T.stripRuntime(k, v);
+      });
       return api('/api/program', { method: 'POST', body: body }).then((r) => {
         O.running = true; O.hasProgram = true; O.project = T.project.name; O.rev = (r && r.programRev) || O.rev + 1;
         O.forced = 0;
@@ -243,7 +248,9 @@
   function poll() {
     if (_inflight) return;                    // never stack requests on a slow link
     _inflight = true;
-    api('/api/state')
+    // the data blocks open in a DB view come along as bytes (hex)
+    const dbs = (T.editors.db && T.editors.db.watching) ? T.editors.db.watching() : [];
+    api('/api/state' + (dbs.length ? '?dbs=' + encodeURIComponent(dbs.join(',')) : ''))
       .then((s) => { _fails = 0; applyState(s); })
       .catch(() => {
         if (O.monitoring && ++_fails >= 10) { // ~1.5 s of silence: the PLC is gone
@@ -293,6 +300,15 @@
         const key = T.memberKey(db.id, k.slice(dot + 1));
         if (typeof v === 'boolean') T.mem.setBit(key, v); else T.mem.setWord(key, +v || 0);
       }
+    }
+    // data block bytes -> the simulator's copy of the DB, which the DB view decodes
+    if (s.dbs) for (const name in s.dbs) {
+      const db = idx.db && idx.db[name];
+      const hex = String(s.dbs[name] || '');
+      let d = null;
+      try { d = db && T.inst.db(db); } catch (e) { d = null; }
+      if (!d || d.buf.length * 2 !== hex.length) continue;      // layouts differ: program not downloaded yet
+      for (let i = 0; i < d.buf.length; i++) d.buf[i] = parseInt(hex.substr(i * 2, 2), 16);
     }
     // liveness -> model flags the editors' highlight() reads
     if (s.live) for (const id in s.live) { const e = idx.el[id]; if (e) e._live = !!s.live[id]; }

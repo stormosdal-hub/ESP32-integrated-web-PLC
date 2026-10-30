@@ -1,6 +1,8 @@
-# variant A: autorun off, plain-GPIO status LED (active-high), Modbus off, PSRAM pins forced free
+# variant A: autorun off, plain-GPIO status LED (active-high), Modbus off, PSRAM pins forced free,
+# no SNTP (the RD_SYS_T clock is left unset)
 # CONFIG_PLC_AUTORUN is not set
 CONFIG_PLC_STATUS_LED_GPIO=y
 CONFIG_PLC_STATUS_LED_PIN=2
 # CONFIG_PLC_MODBUS_ENABLE is not set
 CONFIG_PLC_PSRAM_PINS_FREE=y
+# CONFIG_PLC_SNTP is not set

@@ -874,16 +874,31 @@
         });
       });
     });
+    // SCL: blocks named in a call ("FC"(..), "InstanceDB"(..)) and FBs used as
+    // the type of an interface member (multi-instances) are called, not orphans
+    const names = new Set();
+    p.blocks.forEach((blk) => {
+      if (blk && blk.lang === 'SCL' && T.scl && T.scl.calledNames) T.scl.calledNames(blk.code).forEach((n) => names.add(n));
+      if (blk && blk.iface) Object.keys(blk.iface).forEach((sec) => (blk.iface[sec] || []).forEach(function typeOf(m) {
+        if (!m) return;
+        names.add(String(m.dataType || '').replace(/"/g, '').trim().toLowerCase());
+        (m.members || []).forEach(typeOf);
+      }));
+    });
+    if (names.size) p.blocks.forEach((blk) => {
+      if (!blk || blk.type === 'DB' || !names.has(String(blk.name || '').toLowerCase())) return;
+      set.add(blk.id);
+    });
+    if (names.size) p.blocks.forEach((blk) => {
+      if (blk && blk.type === 'DB' && blk.instanceOf && names.has(String(blk.name || '').toLowerCase())) set.add(blk.instanceOf);
+    });
     return set;
   }
 
-  /* ---- block-local interface storage helpers ---- */
+  /* ---- block-local interface storage helpers ----
+   * Members live in the instance's typed buffer (types.js T.inst); their
+   * classic operand keys (T.memberKey) are routed there by T.mem. */
   function memIsBit(m) { return m.dataType === 'Bool'; }
-  function boolDefault(d) { return /^(1|true|on|yes)$/i.test(String(d == null ? '' : d).trim()); }
-  function numDefault(m) {
-    if (m.dataType === 'Time') return T.parseTime(m.default);
-    const n = parseFloat(m.default); return isNaN(n) ? 0 : n;
-  }
   function writeMember(instanceId, m, v) {
     const key = T.memberKey(instanceId, m.name);
     if (memIsBit(m)) T.mem.setBit(key, !!v); else T.mem.setWord(key, num(v));
@@ -892,19 +907,20 @@
     const key = T.memberKey(instanceId, m.name);
     return memIsBit(m) ? T.mem.getBit(key) : T.mem.getWord(key);
   }
-  // Build the name->storage scope for a block instance and lazily initialise each
-  // member's storage to its declared default the first time the instance is seen.
-  function buildScope(blk, instanceId) {
+  // Build the name->storage scope for a block instance (creating its memory,
+  // with the declared start values, the first time the instance is seen).
+  // Returns null when the block's interface has a type error.
+  function buildScope(blk, instanceId, view) {
+    let d;
+    try { d = T.inst.forBlock(blk, instanceId, view); }
+    catch (e) { console.error('[sim] ' + (blk.name || blk.id) + ': ' + e.message); return null; }
     const scope = Object.create(null);
-    T.ifaceMembers(blk).forEach((entry) => {
-      const m = entry.member;
-      if (!notEmpty(m.name)) return;
-      const key = T.memberKey(instanceId, m.name);
-      const bit = memIsBit(m);
-      scope[String(m.name).toLowerCase()] = { addr: key, bit: bit };
-      if (bit) { if (!(key in T.mem.bits)) T.mem.setBit(key, boolDefault(m.default)); }
-      else { if (!(key in T.mem.words)) T.mem.setWord(key, numDefault(m)); }
+    d.t.fields.forEach((f) => {
+      const key = T.memberKey(instanceId, f.name);
+      if (f.t.k === 'el') scope[f.lname] = { addr: key, bit: f.t.cls === 'bool' };
+      else scope[f.lname] = { addr: key, bit: false, complex: true };
     });
+    scope['\u0000'] = { key: instanceId, t: d.t, d };
     return scope;
   }
 
@@ -927,7 +943,8 @@
     const inVals = getArg ? inParams.map((m) => getArg(m)) : null;
 
     // 2) switch to the callee's local scope (members shadow global tags)
-    const scope = buildScope(blk, instanceId);
+    const scope = buildScope(blk, instanceId, opts.view);
+    if (!scope) return;
     const prevScope = T.setScope(scope);
     const prevInst = _scanCtx.instId;
     _scanCtx.instId = instanceId;        // per-instance element state (see inst())
@@ -940,7 +957,7 @@
       });
       // run the body — SCL is one text program; LAD/FBD are graphical networks
       if (blk.lang === 'SCL') {
-        if (T.scl) { try { T.scl.exec(blk); } catch (e) { console.error('[sim] scl eval error', e); } }
+        if (T.scl) { try { T.scl.exec(blk, scope['\u0000'].d); } catch (e) { console.error('[sim] scl eval error', e); } }
       } else {
         const nets = blk.networks || [];
         for (let ni = 0; ni < nets.length; ni++) {
@@ -1031,8 +1048,18 @@
       _pinCache = Object.create(null);
       _scanCtx = { stack: [], calledIds: new Set(), instId: '@main' };
       clearLiveFlags();
+      if (T.ouc) T.ouc.reset();          // a STOP closes every OUC connection
       // T.mem values are intentionally kept (inputs the user set persist).
     },
+
+    // run a block for one instance (SCL calls of FBs / FCs land here)
+    execute(blockId, opts) { executeBlock(blockId, opts); },
+    // wall clock for RD_SYS_T / RD_LOC_T: ms since 1970-01-01, UTC or local
+    wallMs(local) {
+      const t = Date.now();
+      return local ? t - new Date(t).getTimezoneOffset() * 60000 : t;
+    },
+    onError: null,
 
     start() {
       if (this.running) return;
@@ -1054,6 +1081,7 @@
       if (_timer) { clearInterval(_timer); _timer = null; }
       this.running = false;
       clearLiveFlags();
+      if (T.ouc) T.ouc.reset();
       T.bus.emit('sim:state', { running: false });
       // one tick so editors clear their green highlight
       T.bus.emit('sim:tick');

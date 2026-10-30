@@ -9,12 +9,20 @@
  *         ├ Program blocks                         (icon: folder)
  *         │   ├ <block.name> [<TYPE><number>]      (icon: block)
  *         │   └ (＋ Add new block ...)             (affordance)
+ *         ├ PLC data types                         (icon: folder)
+ *         │   ├ "<type.name>"                      (icon: db)
+ *         │   └ (＋ Add new data type ...)
+ *         ├ External source files                  (icon: folder)
+ *         │   ├ <source.name>                      (icon: open)
+ *         │   ├ (＋ Add new external file ...)
+ *         │   └ (Generate source from blocks ...)
  *         └ PLC tags                               (icon: folder)
  *             └ Default tag table                  (icon: tag)
  *
  * Public API:  T.editors.tree = { render() }
  *
- * Emits  : 'open:block' (block), 'open:tags', 'tree:changed'
+ * Emits  : 'open:block' (block), 'open:tags', 'open:type' (type),
+ *          'open:source' (source), 'tree:changed', 'types:changed'
  * Listens: 'project:loaded', 'tree:changed', 'block:activated'
  *
  * Uses ONLY window.TIA.* helpers. IIFE — no globals beyond T.editors.tree.
@@ -102,7 +110,7 @@
   function seedDefaults() {
     if (seeded) return;
     seeded = true;
-    ['project', 'device', 'blocks', 'tags'].forEach((k) => expanded.add(k));
+    ['project', 'device', 'blocks', 'types', 'sources', 'tags'].forEach((k) => expanded.add(k));
   }
   const isOpen = (key) => expanded.has(key);
   function toggle(key) {
@@ -256,6 +264,72 @@
       host.appendChild(addRow);
     }
 
+    /* --- PLC data types --- */
+    const types = Array.isArray(p.types) ? p.types : [];
+    host.appendChild(nodeRow({
+      key: 'types', depth: 2, iconName: 'folder',
+      label: 'PLC data types', open: isOpen('types'),
+      onContext: (e) => showMenu(e, [['Add new data type', 'add', openAddTypeModal]]),
+    }));
+    if (isOpen('types')) {
+      types.forEach((ty) => {
+        host.appendChild(nodeRow({
+          depth: 3, leaf: true, iconName: 'db', label: ty.name,
+          title: 'PLC data type "' + ty.name + '"' + (ty.comment ? ' — ' + ty.comment : ''),
+          selected: selKey === ty.id,
+          onClick: () => { selKey = ty.id; render(); },
+          onDblClick: () => T.bus.emit('open:type', ty),
+          onContext: (e) => showMenu(e, [
+            ['Open', 'open', () => T.bus.emit('open:type', ty)],
+            ['Rename', 'block', () => openRenameTypeModal(ty)],
+            null,
+            ['Delete', 'trash', () => deleteType(ty), true],
+          ]),
+        }));
+      });
+      host.appendChild(nodeRow({
+        depth: 3, leaf: true, iconName: 'add', label: 'Add new data type ...',
+        extraClass: 'tia-tree-add', onClick: () => openAddTypeModal(),
+      }));
+    }
+
+    /* --- External source files --- */
+    const sources = Array.isArray(p.sources) ? p.sources : [];
+    host.appendChild(nodeRow({
+      key: 'sources', depth: 2, iconName: 'folder',
+      label: 'External source files', open: isOpen('sources'),
+      onContext: (e) => showMenu(e, [
+        ['Add new external file ...', 'add', () => T.extsrc && T.extsrc.addFiles()],
+        ['Generate source from blocks ...', 'compile', () => T.extsrc && T.extsrc.fromBlocksDialog()],
+      ]),
+    }));
+    if (isOpen('sources')) {
+      sources.forEach((src) => {
+        host.appendChild(nodeRow({
+          depth: 3, leaf: true, iconName: 'open', label: src.name,
+          sub: src.text ? '(' + Math.max(1, Math.round(src.text.length / 1024)) + ' KB)' : '',
+          selected: selKey === src.id,
+          onClick: () => { selKey = src.id; render(); },
+          onDblClick: () => T.bus.emit('open:source', src),
+          onContext: (e) => showMenu(e, [
+            ['Open', 'open', () => T.bus.emit('open:source', src)],
+            ['Generate blocks from source', 'compile', () => T.extsrc && T.extsrc.generate(src)],
+            ['Export file ...', 'download', () => T.extsrc && T.extsrc.exportFile(src)],
+            null,
+            ['Delete', 'trash', () => T.extsrc && T.extsrc.remove(src), true],
+          ]),
+        }));
+      });
+      host.appendChild(nodeRow({
+        depth: 3, leaf: true, iconName: 'add', label: 'Add new external file ...',
+        extraClass: 'tia-tree-add', onClick: () => T.extsrc && T.extsrc.addFiles(),
+      }));
+      host.appendChild(nodeRow({
+        depth: 3, leaf: true, iconName: 'compile', label: 'Generate source from blocks ...',
+        extraClass: 'tia-tree-add', onClick: () => T.extsrc && T.extsrc.fromBlocksDialog(),
+      }));
+    }
+
     /* --- PLC tags --- */
     host.appendChild(nodeRow({
       key: 'tags', depth: 2, iconName: 'folder',
@@ -305,16 +379,24 @@
   }
 
   function showBlockMenu(e, b) {
+    const items = [
+      ['Open', 'open', () => openBlock(b)],
+      ['Rename', 'block', () => openRenameModal(b)],
+    ];
+    // SCL blocks, DBs: as a TIA external source
+    if (b.type === 'DB' || b.lang === 'SCL') items.push(['Generate source from block', 'compile', () => T.extsrc && T.extsrc.fromBlocks([b])]);
+    items.push(null, ['Delete', 'trash', () => deleteBlock(b), true]);
+    showMenu(e, items);
+  }
+
+  /* a context menu from [label, icon, handler, danger] items (null = separator) */
+  function showMenu(e, items) {
     e.preventDefault();
     e.stopPropagation();
     closeContextMenu();
 
     ctxEl = T.el('div', { class: 'tia-ctx' },
-      ctxItem('Open', 'open', () => openBlock(b)),
-      ctxItem('Rename', 'block', () => openRenameModal(b)),
-      T.el('div', { class: 'tia-ctx-sep' }),
-      ctxItem('Delete', 'trash', () => deleteBlock(b), true)
-    );
+      ...items.map((it) => it ? ctxItem(it[0], it[1], it[2], it[3]) : T.el('div', { class: 'tia-ctx-sep' })));
     document.body.appendChild(ctxEl);
 
     // position, keeping the menu inside the viewport
@@ -455,7 +537,8 @@
     const typeSel = T.el('select', { class: 'tia-input' },
       T.el('option', { value: 'OB' }, 'OB — Organization block'),
       T.el('option', { value: 'FC' }, 'FC — Function'),
-      T.el('option', { value: 'FB' }, 'FB — Function block')
+      T.el('option', { value: 'FB' }, 'FB — Function block'),
+      T.el('option', { value: 'DB' }, 'DB — Global data block')
     );
     const langSel = T.el('select', { class: 'tia-input' },
       T.el('option', { value: 'LAD' }, 'LAD — Ladder logic'),
@@ -471,9 +554,9 @@
       if (!autoName) return;
       const t = typeSel.value;
       const n = T.nextBlockNumber(t);
-      nameInp.value = (t === 'OB' ? 'Block_' : (t === 'FB' ? 'FunctionBlock_' : 'Function_')) + n;
+      nameInp.value = (t === 'OB' ? 'Block_' : t === 'FB' ? 'FunctionBlock_' : t === 'DB' ? 'Data_block_' : 'Function_') + n;
     }
-    typeSel.addEventListener('change', suggest);
+    typeSel.addEventListener('change', () => { langSel.disabled = typeSel.value === 'DB'; suggest(); });
     suggest();
 
     buildModal({
@@ -490,8 +573,9 @@
         if (nameClash(name, null)) { showErr('A block with that name already exists.'); return false; }
 
         const type = typeSel.value;
-        const lang = langSel.value;
+        const lang = type === 'DB' ? 'DB' : langSel.value;
         const b = T.model.newBlock(type, name, T.nextBlockNumber(type), lang);
+        if (type === 'DB') { delete b.iface; b.members = []; b.startValues = {}; }
         T.project.blocks.push(b);
         T.bus.emit('tree:changed');
         // open the freshly created block
@@ -523,6 +607,90 @@
     });
   }
 
+  /* ------------------------------------------------------ PLC data types */
+  function typeClash(name, own) {
+    const lc = name.toLowerCase();
+    return (T.project.types || []).some((x) => x !== own && String(x.name || '').toLowerCase() === lc);
+  }
+  const TYPE_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+  function openAddTypeModal() {
+    closeContextMenu();
+    if (!T.project) return;
+    const types = T.project.types || (T.project.types = []);
+    let n = types.length + 1;
+    while (typeClash('UserDataType_' + n, null)) n++;
+    const nameInp = T.el('input', { class: 'tia-input', type: 'text', value: 'UserDataType_' + n });
+    buildModal({
+      title: 'Add new PLC data type',
+      rows: [{ label: 'Name', field: nameInp }],
+      focusEl: nameInp,
+      onOk(showErr) {
+        const name = (nameInp.value || '').trim();
+        if (!TYPE_NAME.test(name)) { showErr('Letters, digits and _ only, not starting with a digit.'); return false; }
+        if (typeClash(name, null)) { showErr('A data type with that name already exists.'); return false; }
+        const ty = { id: T.uid('udt'), name, comment: '', version: '0.1', members: [T.model.newMember('member1', 'Bool')] };
+        types.push(ty);
+        selKey = ty.id;
+        T.bus.emit('types:changed', ty);
+        T.bus.emit('tree:changed');
+        T.bus.emit('open:type', ty);
+        T.status('Created PLC data type "' + name + '".', 'info');
+      },
+    });
+  }
+  function openRenameTypeModal(ty) {
+    closeContextMenu();
+    const nameInp = T.el('input', { class: 'tia-input', type: 'text', value: ty.name });
+    buildModal({
+      title: 'Rename PLC data type',
+      rows: [{ label: 'Name', field: nameInp }],
+      focusEl: nameInp,
+      onOk(showErr) {
+        const name = (nameInp.value || '').trim();
+        if (!TYPE_NAME.test(name)) { showErr('Letters, digits and _ only, not starting with a digit.'); return false; }
+        if (typeClash(name, ty)) { showErr('A data type with that name already exists.'); return false; }
+        if (name === ty.name) return;
+        const n = retypeAll(ty.name, name);
+        ty.name = name;
+        T.bus.emit('types:changed', ty);
+        T.bus.emit('tree:changed');
+        T.status('Renamed to "' + name + '"' + (n ? ' — updated ' + n + ' use(s)' : '') + '.', 'info');
+      },
+    });
+  }
+  // every member / DB that names data type `from`; rename (to) or count (to = null)
+  function retypeAll(from, to) {
+    const re = new RegExp('"' + from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '"', 'gi');
+    let n = 0;
+    const visit = (list) => (list || []).forEach((m) => {
+      if (!m) return;
+      const dt = String(m.dataType || '');
+      if (re.test(dt)) { n++; if (to != null) m.dataType = dt.replace(re, '"' + to + '"'); }
+      re.lastIndex = 0;
+      visit(m.members);
+    });
+    const p = T.project;
+    (p.types || []).forEach((t) => visit(t.members));
+    (p.blocks || []).forEach((b) => {
+      if (b.iface) Object.keys(b.iface).forEach((s) => visit(b.iface[s]));
+      visit(b.members);
+      if (b.dbType && String(b.dbType).replace(/"/g, '').toLowerCase() === from.toLowerCase()) { n++; if (to != null) b.dbType = to; }
+    });
+    return n;
+  }
+  function deleteType(ty) {
+    const uses = retypeAll(ty.name, null);
+    let msg = 'Delete PLC data type "' + ty.name + '"?';
+    if (uses) msg += '\n\n⚠ It is used in ' + uses + ' place(s) — those declarations become invalid (Compile will flag them).';
+    if (!window.confirm(msg)) return;
+    const list = T.project.types || [];
+    const i = list.indexOf(ty);
+    if (i >= 0) list.splice(i, 1);
+    T.bus.emit('types:changed', ty);
+    T.bus.emit('tree:changed');
+    T.status('Deleted PLC data type "' + ty.name + '".', 'info');
+  }
+
   /* case-insensitive duplicate-name guard (ignoring the block being edited) */
   function nameClash(name, ownId) {
     if (!T.project) return false;
@@ -534,7 +702,7 @@
   /*  PUBLIC API + EVENT WIRING                                              */
   /* ====================================================================== */
   T.editors = T.editors || {};
-  T.editors.tree = { render };
+  T.editors.tree = { render, buildModal, closeModal };
 
   // Full re-render when the project or its block set changes.
   T.bus.on('project:loaded', render);

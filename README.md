@@ -4,8 +4,9 @@ The ESP32 **is** the PLC — an **ESP32-S3**, a **classic ESP32**, an **ESP32-C3
 an **ESP32-P4** with an ESP32-C6 for Wi-Fi. It serves a
 Siemens-TIA-Portal-style IDE over Wi-Fi — **Ladder (LAD)**, **Function Block Diagram
 (FBD)** and **Structured Control Language (SCL)** editors, tag table, block interfaces,
-instance DBs and a simulator — and runs the program you download on its own GPIO pins,
-like a small S7-1200:
+PLC data types, global and instance DBs, external source files and a simulator — and
+runs the program you download on its own GPIO pins, like a small S7-1200, including
+**Open User Communication** over TCP (`TCON`, `TDISCON`, `TSEND`, `TRCV`):
 
 ```
  browser (PC / tablet / phone)       ESP32-S3 / ESP32 / C3 / C6 / P4
@@ -144,7 +145,7 @@ The *Online (PLC)* toolbar group (and the *Online* menu):
 | **Connect** | Goes online. Happens automatically when the IDE is opened from the PLC. |
 | **Download → PLC** | Compiles (stops on errors), checks the I/O map, sends the program. The PLC stops, stores the program in flash, compiles it and goes to RUN. If anything fails, the previous program keeps running. |
 | **Upload ← PLC** | Loads the program stored on the PLC into the editor (TIA *Upload from device*). A browser that has never saved a project does this automatically on first visit. |
-| **Monitor** | Live values on the diagrams, the Simulation table and the instance-DB view. |
+| **Monitor** | Live values on the diagrams, the Simulation table and the data block view. |
 | **Start / Stop CPU** | RUN / STOP. STOP switches every output off, like a real PLC. The RUN/STOP state survives a power cycle. |
 | **Address** | Where the PLC is reachable (name, IP, Modbus port). |
 
@@ -324,6 +325,101 @@ module) and its outputs are re-sent when it's back; *Device* and the module's ba
 "not responding", and the serial log names the module and its address. Power the modules
 from 3.3 V; most module boards already carry the bus pull-up resistors.
 
+## Data types, data blocks and SCL
+
+Interface members, PLC data types and DB members take TIA's data types — typed freely
+in the *Data type* column, with suggestions:
+
+- every elementary type: `Bool Byte Word DWord SInt USInt Int UInt DInt UDInt Real LReal
+  Time Date Time_Of_Day Char` (and `CONN_OUC`, `HW_ANY` … = Word)
+- `String` / `String[n]`, `DTL`, `Array[lo..hi(, lo..hi)] of T`, `Struct` (its members
+  are edited in nested rows below it), `Variant` (FC parameters)
+- **PLC data types** (UDTs, project tree ▸ *PLC data types*) — written `"Name"`
+- FB instances: your own FBs (`"Motor"`, a multi-instance) and the system FBs
+  `TON TOF TP IEC_TIMER R_TRIG F_TRIG CTU CTD CTUD (… _INT / _DINT / _UDINT …) TCON
+  TDISCON TSEND TRCV`, and `TCON_IP_v4`
+
+All of it is laid out like a TIA data block with **standard (non-optimized) access**:
+Bools packed into bytes, everything else on even addresses, big-endian, `String[n]` =
+n + 2 bytes. A struct sent with `TSEND` therefore has exactly the bytes a real S7 PLC
+would send — the IDE's *Offset* column shows where every member sits.
+
+**Data blocks.** *Add new block ▸ DB* makes a global DB with its own members; a DB can
+also be of a PLC data type or an instance DB of an FB. Opening a DB shows the typed
+structure (expand structs and arrays), the **start values** (editable — used on the
+next download, or right away in the stopped simulator) and the **monitor values**:
+from the simulator, or read from the ESP32 while monitoring online.
+
+**SCL** is TIA's typed SCL: `#local`, `"Global".member`, `"DB".arr[#i].x`, `%MW10`,
+slices (`#w.%X3`, `#d.%B0`), typed literals (`16#FF`, `INT#5`, `T#2s`, `D#2024-01-31`,
+`TOD#12:00:00`), `REGION`, `CASE` with constants, FB calls (`#inst(...)`,
+`"InstDB"(...)`), FC calls with return values, `EN`/`ENO`, `X_TO_Y` conversions,
+`MIN MAX LIMIT SEL SHL SHR ROL ROR NORM_X SCALE_X TRUNC ROUND CEIL FLOOR`,
+`CountOfElements`, `LEN`, `MAX_LEN`, `RD_SYS_T` / `RD_LOC_T` (the ESP32 sets its clock
+by SNTP once on Wi-Fi; time zone in *menuconfig ▸ ESP32 Web PLC ▸ Clock*). Integer
+arithmetic is integer arithmetic (`7 / 2 = 3`, results wrap to the type), `ROUND`
+rounds half to even, as on an S7.
+
+There is **no retentive memory**: the ESP32 starts every DB from its start values
+after a download or power-up. `RETAIN` in a source file is accepted and ignored.
+
+## External source files (generate blocks from source)
+
+Project tree ▸ *External source files* works like TIA's:
+
+- **Add new external file …** — pick `.scl`, `.udt` or `.db` files (exported from TIA
+  or written by hand). A source can hold any number of `TYPE`, `FUNCTION`,
+  `FUNCTION_BLOCK`, `ORGANIZATION_BLOCK` and `DATA_BLOCK` units.
+- **Generate blocks from source** (right-click, or the button in the opened file) —
+  creates or updates the PLC data types, SCL blocks and DBs it contains (it asks before
+  overwriting) and compiles them; errors link to their line.
+- **Generate source from blocks …** — writes SCL blocks, PLC data types and DBs out as
+  a new source file (right-click a block for just that one); *Export file* saves it
+  in TIA's format.
+
+Sources are saved with the project but not downloaded to the PLC.
+
+`examples/tcplink/` is a complete example: `TcpLink.scl` (a general PLC ⇄ PC link
+over one TCP connection, its retentive history removed for the ESP32), its UDTs and
+`TcpLinkDemo.db` (the DBs and a cyclic OB). Add all six files, generate them in the
+order `*.udt`, `TcpLink.scl`, `TcpLinkDemo.db`, download, and talk to it from a PC:
+
+```bash
+python tools/tcplink_client.py <PLC address> --set StartCmd=1 --set Setpoint=42
+```
+
+## Open User Communication (TCP)
+
+`TCON`, `TDISCON`, `TSEND` and `TRCV` work as on an S7-1200 (as system FBs in SCL:
+`#conn(REQ := ..., ID := 1, CONNECT := #param, ...)` with a `TCON_IP_v4` parameter
+block), with S7 `STATUS` codes (`7000`/`7001`/`7002`, `80A1`, `80A3`, `80A4`, `80A7`,
+`80B3`, `80B6`, `80C4`, `8088` …):
+
+- **passive** (`ActiveEstablished := FALSE`): listens on `LocalPort` and accepts one
+  client; **active**: connects to `RemoteAddress:RemotePort`, retried about every second
+  while refused. Up to 8 connections. `TDISCON` and CPU **STOP** close them (`TCON`
+  reports `80A7` if aborted); `TCON` connects again after RUN.
+- `TSEND` sends up to 8192 bytes per job; `TRCV` with `LEN > 0` waits for exactly that
+  many bytes (TCP stream framing), `LEN = 0` takes what has arrived. The ESP32 keeps
+  4 KB per connection until `TRCV` takes it (*menuconfig ▸ Open User Communication*;
+  a full buffer just slows the sender down — keep it at least as large as your largest
+  fixed `LEN`).
+- The sockets are served by their own task: the scan only copies bytes, so a slow
+  partner never stretches the cycle. `GET /api/ouc` lists the connections and their
+  partners.
+- In the **browser simulator** and the parity tests the program's own `TCON`s connect
+  to each other over a built-in virtual network (an active `TCON` to the PLC's own
+  address reaches a passive one on that port). The **PC emulator** opens real sockets.
+
+**Memory.** Compiling the TcpLink example (≈ 60 KB of project JSON) takes roughly
+250 KB of heap at its peak — about 140 KB of that is the parsed JSON and the SCL
+compiler's scratch memory, which go to PSRAM when the board has it — and the running
+program keeps roughly 100 KB (measured with the PC build, scaled for the ESP32's 32-bit
+pointers). Each open connection adds its receive buffer, plus up to 8 KB while sending.
+An ESP32-S3 or P4 with PSRAM handles programs of that size comfortably; without PSRAM,
+and on a classic ESP32, C3 or C6 next to Wi-Fi, keep programs smaller — a download
+that runs out of memory fails with *out of memory while compiling the program*.
+
 ## Scan cycle
 
 *ESP32 ▸ I/O config ▸ Runtime ▸ Scan cycle* (1–2000 ms, default 50). Timers are
@@ -375,7 +471,8 @@ clients keep working.
 | Request | Purpose |
 |---|---|
 | `GET /api/info` | CPU, program, cycle time, device, Wi-Fi |
-| `GET /api/state` | live snapshot: `mem` (tags, members, addresses), `live`, `power`, `pins`, `forced`, `cycle` |
+| `GET /api/state[?dbs=A,B]` | live snapshot: `mem` (tags, members, addresses), `live`, `power`, `pins`, `forced`, `cycle`; `dbs`: the named data blocks' bytes (hex) |
+| `GET /api/ouc` | Open User Communication: the program's connections and the sockets behind them |
 | `GET /api/tags` | declared tags (+ `programRev`, bumps on every download) |
 | `GET /api/netinfo`, `GET /api/modbus-map`, `GET /api/pins` | address info, Modbus map, usable pins |
 | `POST /api/program` | download a project (JSON body) |
@@ -407,12 +504,16 @@ ESP32's pin rules and board view instead of the S3's (`esp32c3`, `esp32c6` likew
 python test/parity/run_parity.py
 ```
 
-Runs eight test programs (the demo, LAD bit logic, timers, counters, math/memory
-overlap, FBD, block calls with instance DBs, SCL) through **the IDE's own JavaScript
-simulator in Node** and through **the C engine**, step by step, and compares every tag
-value and every live/power/pin flag. `python test/parity/fuzz.py 3000` feeds randomly
-corrupted projects to the engine to make sure a bad download can never crash the PLC.
-Both need `gcc` and `node` on PATH.
+Runs eleven test programs (the demo, LAD bit logic, timers, counters, math/memory
+overlap, FBD, block calls with instance DBs, SCL, typed SCL with data types and DBs,
+OUC connections, and the TcpLink example generated from its sources talking to a test
+client) through **the IDE's own JavaScript simulator in Node** and through **the C
+engine**, step by step, and compares every tag value, every live/power/pin flag, every
+byte of every data block and every connection's state. It also runs the host tests of
+the shift registers, I2C modules and the TCP layer behind OUC (over loopback).
+`python test/parity/fuzz.py 3000` feeds randomly corrupted projects to the engine to
+make sure a bad download can never crash the PLC (`PLC_STACK_LIMIT=<bytes>` checks the
+stack guard's error paths too). Both need `gcc` and `node` on PATH.
 
 ```powershell
 .\tools\build_all.ps1
@@ -441,18 +542,31 @@ bugs in both its simulator and `plc_engine.py`):
 - Raspberry-Pi pin numbers (`bcm`) in an imported project are ignored; the I/O view
   offers to remove them.
 
+SCL became TIA's typed SCL (see *Data types, data blocks and SCL*). Programs written for
+the untyped SCL keep working, with these differences where the types now matter:
+
+- `/` on two integer operands (Int / DInt tags, members, integer literals) divides as
+  integers (`7 / 2 = 3`); write `7.0 / 2` or use a `Real` for a fraction. Results
+  written to a typed tag or member wrap to its type (an `Int` holds −32768…32767).
+- `ROUND` rounds half to even (`ROUND(2.5) = 2`), as on an S7.
+- Interface members and DB members live in typed memory: a `Real` member stores a
+  32-bit float, a `Byte` member 0…255.
+
 ## Project layout
 
 ```
 components/plc_core/   portable PLC engine (C): compiler + scan, SCL, JSON — no ESP-IDF deps
-main/                  firmware: runtime, I/O, flash store, Wi-Fi, web server, Modbus, LED
+main/                  firmware: runtime, I/O, flash store, Wi-Fi, web server, Modbus, LED,
+                       OUC sockets (ouc_net.c — also used by the emulator)
 web/                   the IDE (served by the ESP32; also runs from file://)
+examples/tcplink/      TcpLink: SCL + UDT + DB sources for "Generate blocks from source"
 sdkconfig.defaults     build settings for every chip; sdkconfig.defaults.<chip>: chip extras
 dependencies.lock.*    pinned component versions, one lock file per chip
 tools/idf.ps1          idf.py wrapper (activates ESP-IDF; -Chip <chip> = own sdkconfig + build folder)
 tools/build_all.ps1    builds every chip / test configuration
 tools/embed_web.py     gzips web/ into the firmware at build time
 tools/plc_emulator.py  PC emulator (same engine via ctypes)
+tools/tcplink_client.py  PC side of the TcpLink example
 test/parity/           JS-simulator-vs-C-engine parity tests and fuzzer
 test/config/           menuconfig variants for build_all.ps1
 partitions.csv         app 2.5 MB + program store 1 MB (fits 4 MB flash)

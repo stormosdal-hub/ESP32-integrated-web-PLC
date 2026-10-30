@@ -36,12 +36,63 @@ extern "C" {
 
 typedef struct plc plc_t;
 
+/* ---- Open User Communication transport (TCON/TDISCON/TSEND/TRCV) --------- */
+#define PLC_MAX_CONNS 8         /* OUC connections open at the same time */
+
+typedef struct {
+    uint16_t id;            /* connection ID (CONN_OUC), 1..4095 */
+    uint8_t type;           /* 11 = TCP (the only type the engine opens) */
+    bool active;            /* true: connect to rip:rport; false: listen on lport */
+    uint8_t rip[4];         /* remote IPv4 address (active) */
+    uint16_t rport;         /* remote port (active) */
+    uint16_t lport;         /* local port (passive: required; active: 0 = any) */
+} plc_conn_cfg_t;
+
+enum { PLC_NET_CONNECTING = 0, PLC_NET_CONNECTED = 1, PLC_NET_CLOSED = 2 };
+
+/* The network behind the OUC instructions. Every call comes from inside
+ * plc_scan() (scan task, runtime lock held), so none may block. Failures are
+ * returned as the negated S7 STATUS word (e.g. -0x80A1). Without one
+ * (plc_env_t.net == NULL) the engine uses its built-in virtual network:
+ * connections between the program's own TCONs only, like the simulator. */
+typedef struct {
+    void *user;
+    /* start listening (passive) or connecting (active): a handle >= 0, or -status */
+    int (*open)(void *user, const plc_conn_cfg_t *cfg);
+    /* PLC_NET_CONNECTING / PLC_NET_CONNECTED / PLC_NET_CLOSED (the partner
+     * closed it, or it broke after being established), or -status */
+    int (*state)(void *user, int h);
+    /* take one whole message to send (copied): 0, or -status (e.g. the
+     * previous message is still being sent, or it does not fit the buffer) */
+    int (*send)(void *user, int h, const uint8_t *data, uint32_t len);
+    /* 1: the last accepted message has been handed to TCP, 0: still
+     * sending, -status: the send failed */
+    int (*send_done)(void *user, int h);
+    /* bytes received and not yet taken */
+    uint32_t (*rx_avail)(void *user, int h);
+    /* remove up to n received bytes into buf; returns how many were taken */
+    uint32_t (*rx_take)(void *user, int h, uint8_t *buf, uint32_t n);
+    /* close and forget the connection (also aborts a listen / connect) */
+    void (*close)(void *user, int h);
+} plc_net_t;
+
 typedef struct {
     double (*now_ms)(void *user);   /* monotonic clock in milliseconds (required) */
     void *user;
     void *(*alloc)(size_t n);       /* IR + tables; NULL -> malloc */
     void *(*alloc_big)(size_t n);   /* transient JSON DOM (may be PSRAM); NULL -> alloc */
     void (*free)(void *p);          /* NULL -> free */
+    /* wall clock for RD_SYS_T / RD_LOC_T: milliseconds since 1970-01-01, UTC
+     * (local == false) or local time (local == true). NULL -> derived from
+     * now_ms, starting at 1970-01-01 */
+    double (*wall_ms)(void *user, bool local);
+    const plc_net_t *net;           /* OUC transport; NULL -> virtual network */
+    /* C stack the engine may use below plc_load() / plc_scan() / plc_force()
+     * (bytes; 0 = unchecked). Past it a program nested too deeply fails to
+     * compile, or the block call / SCL statement is cut short with a runtime
+     * error, instead of overflowing the task stack. Keep room above it for
+     * the caller's frames and the deepest leaf calls (printf). */
+    size_t stack_limit;
 } plc_env_t;
 
 /* ---- hardware I/O points (from project.gpio) ----------------------------- */
@@ -143,12 +194,25 @@ size_t plc_forced_count(const plc_t *p);
  * "forced" into the object currently open in w. */
 void plc_snapshot_json(plc_t *p, jw_t *w);
 void plc_tags_json(const plc_t *p, jw_t *w);            /* array of {name,dataType,address,comment} */
+/* data block contents: object {"<DB name>": "<hex bytes>"} — every DB, or only
+ * the comma-separated names in `only` (the IDE decodes them with its own
+ * copy of the layout rules, web/js/types.js) */
+void plc_dbs_json(plc_t *p, jw_t *w, const char *only);
 void plc_modbus_map_json(const plc_t *p, jw_t *w, unsigned bank); /* object tag -> {kind,address[,registers]} */
 uint32_t plc_error_count(const plc_t *p);
 const char *plc_last_error(const plc_t *p);
 
 /* raw process image access (Modbus) */
 uint8_t *plc_area(plc_t *p, char area, size_t *size);
+
+/* ---- Open User Communication --------------------------------------------- */
+/* Close every OUC connection (CPU STOP; plc_free does it too). The program's
+ * TCON/TSEND/TRCV calls see the connections gone and report errors, so a
+ * state machine like TcpLink reconnects on the next RUN. */
+void plc_comm_reset(plc_t *p);
+/* array of the program's connections: {id, state, active, localPort,
+ * remoteAddress, remotePort} (state: "connecting" / "connected" / "closed") */
+void plc_conns_json(plc_t *p, jw_t *w);
 
 #ifdef __cplusplus
 }

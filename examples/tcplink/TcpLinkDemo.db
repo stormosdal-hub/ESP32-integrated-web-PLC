@@ -1,0 +1,77 @@
+// Demo for TcpLink on the ESP32 Web PLC: the data blocks around one TcpLink
+// instance and a cyclic OB that calls it. Generate the UDTs (*.udt) and
+// TcpLink.scl first, then this file.
+//
+// A client (tools/tcplink_client.py, or your own program) connects to the
+// PLC on port 2000 and gets the names, then a data message whenever
+// something changes (at least every second).
+
+DATA_BLOCK "LinkData"
+{ S7_Optimized_Access := 'FALSE' }
+VERSION : 0.1
+NON_RETAIN
+   VAR
+      txDigital : "TcpLinkTxDigital";   // PLC -> PC events
+      txAnalog : "TcpLinkTxAnalog";     // PLC -> PC measurements
+      deadband : "TcpLinkTxAnalog";     // per-element deadband for txAnalog
+      rx : "TcpLinkRx";                 // PC -> PLC, written by TcpLink
+      status : Struct
+         connected : Bool;
+         linkState : Int;
+         rxStale : Bool;
+         txCount : UDInt;
+         rxCount : UDInt;
+      END_STRUCT;
+   END_VAR
+
+BEGIN
+   deadband.reals[0] := 0.5;
+   deadband.reals[1] := 0.5;
+END_DATA_BLOCK
+
+DATA_BLOCK "TcpLinkNames_DB"
+{ S7_Optimized_Access := 'FALSE' }
+VERSION : 0.1
+NON_RETAIN
+"TcpLinkNames"
+
+BEGIN
+   txBits[0] := 'Motor';
+   txBits[1] := 'RunLamp';
+   txInts[0] := 'PartCount';
+   txReals[0] := 'Speed';
+   rxBits[0] := 'StartCmd';
+   rxInts[0] := 'Setpoint';
+END_DATA_BLOCK
+
+DATA_BLOCK "TcpLink_DB"
+{ S7_Optimized_Access := 'FALSE' }
+VERSION : 0.1
+NON_RETAIN
+"TcpLink"
+
+BEGIN
+END_DATA_BLOCK
+
+ORGANIZATION_BLOCK "TcpLinkCyclic"
+{ S7_Optimized_Access := 'FALSE' }
+VERSION : 0.1
+BEGIN
+   // the link: passive, listens on port 2000 (connection ID 1)
+   "TcpLink_DB"(txDigital := "LinkData".txDigital,
+                txAnalog := "LinkData".txAnalog,
+                deadband := "LinkData".deadband,
+                names := "TcpLinkNames_DB",
+                rx => "LinkData".rx,
+                connected => "LinkData".status.connected,
+                linkState => "LinkData".status.linkState,
+                rxStale => "LinkData".status.rxStale,
+                txCount => "LinkData".status.txCount,
+                rxCount => "LinkData".status.rxCount);
+
+   // what the PC sees: map your own tags onto the slots
+   "LinkData".txDigital.bits[0] := "Motor";
+   "LinkData".txDigital.bits[1] := "Run_Lamp";
+   "LinkData".txAnalog.ints[0] := "Part_Count";
+   "LinkData".txAnalog.reals[0] := "Conveyor_PWM";
+END_ORGANIZATION_BLOCK

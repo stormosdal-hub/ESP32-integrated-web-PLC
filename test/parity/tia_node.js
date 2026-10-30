@@ -31,7 +31,7 @@ function load(webDir) {
   const log = console.log;
   console.log = () => {};                      // modules announce themselves on load
   try {
-    for (const f of ['core.js', 'scl.js', 'sim.js']) {
+    for (const f of ['core.js', 'types.js', 'scl.js', 'sysfb.js', 'sources.js', 'sim.js']) {
       vm.runInThisContext(fs.readFileSync(path.join(webDir, 'js', f), 'utf8'), { filename: f });
     }
   } finally {

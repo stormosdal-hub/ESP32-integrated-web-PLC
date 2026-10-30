@@ -55,9 +55,12 @@ with `T.model.*` so shapes match the editors). Cases are regenerated on every ru
 ## Where things live
 - `components/plc_core/` — portable engine, **no ESP-IDF includes** (also built by
   gcc for tests and the emulator). `plc_engine.h` public API; `plc_internal.h` IR;
-  `plc_engine.c` compile + scan; `plc_scl.c` SCL; `jdom` read-only JSON DOM (cJSON
-  costs ~90 B/value — too much RAM); `jw` JSON writer. Compile uses an arena; OOM
-  during compile/force longjmps out.
+  `plc_engine.c` compile + scan; `plc_scl.c` typed SCL (tokens through a 256-token
+  ring, parsed and compiled one top-level statement at a time in scratch memory);
+  `plc_types.c` data types + S7 standard layout (port of `types.js`); `plc_sysfb.c`
+  system FBs incl. TCON/TDISCON/TSEND/TRCV and the virtual network (port of
+  `sysfb.js`); `jdom` read-only JSON DOM (cJSON costs ~90 B/value — too much RAM);
+  `jw` JSON writer. Compile uses an arena; OOM during compile/force longjmps out.
 - `main/` — `plc_runtime` (CPU, mutex, scan task on core 1, download pipeline),
   `plc_io_esp` (GPIO/LEDC/ADC + board pin knowledge + I/O validation — **all
   per-chip pin rules live here**: `CHIP_NAME`, `BOOT_PIN`, `BOARD_LAYOUT`,
@@ -66,10 +69,17 @@ with `T.model.*` so shapes match the editors). Cases are regenerated on every ru
   a new chip/board is an `#elif` there, a `LAYOUTS` entry in `esp32.js` and a
   `board_<chip>()` / `P4_BOARDS` entry in `tools/plc_emulator.py`), `plc_store`
   (A/B flash slots, header written last, read via mmap), `web_server` (API + gzip
-  assets), `wifi_mgr` (STA + setup-AP fallback + mDNS), `modbus_tcp`, `status_led`.
+  assets), `wifi_mgr` (STA + setup-AP fallback + mDNS + SNTP), `modbus_tcp`,
+  `status_led`, `ouc_net` (the engine's `plc_net_t` over non-blocking sockets — no IDF
+  includes, also linked into the emulator and `test/host/test_ouc_net.c`) and `ouc_esp`
+  (its poll task on core 0).
 - `web/js/esp32.js` — the ESP32 view (I/O map, board diagram per chip, device); pin
   data comes from `/api/pins` and is cached in localStorage. `online.js` — API
-  client, monitoring, forcing, upload. Other `web/js/*` follow the Pi project's
+  client, monitoring, forcing, upload. `types.js` data types / layout / typed
+  buffers (`T.types`, `T.inst`), `scl.js` typed SCL, `sysfb.js` system FBs + OUC
+  (`T.ouc`), `sources.js` source parser / generator (`T.sources`), `extsrc.js` the
+  External source files UI, `iface.js` member editor + PLC data type editor + DB view.
+  Other `web/js/*` follow the Pi project's
   `CLAUDE.md` rules (classic scripts, `window.TIA`, `T.el`, `T.injectCSS`, must still
   run from `file://`).
 - `tools/plc_emulator.py` + `tools/emulator/plc_emu.c` — PC emulator of the API using
@@ -84,8 +94,13 @@ with `T.model.*` so shapes match the editors). Cases are regenerated on every ru
 - `plc_destroy`: unit structs live in the arena — free their heap maps **before** the
   arena (a use-after-free the fuzzer found).
 - Recursion costs stack on the 16 KB task stacks: SCL nesting is capped
-  (`MAX_EXPR_DEPTH`/`MAX_STMT_DEPTH`), block calls at 16 (`PLC_MAX_CALL_DEPTH`).
-  Don't put big arrays on the stack in recursive paths.
+  (`MAX_EXPR_DEPTH`/`MAX_STMT_DEPTH`), block calls at 16 (`PLC_MAX_CALL_DEPTH`), and
+  `env.stack_limit` (10 KB in the firmware) is checked with `plc_stack_low()` in every
+  recursive path (SCL parse / compile / `ev` / `run_s`, `run_unit`, `ty_parse`) — a
+  new recursive path needs the check too. Don't put big buffers in the frames of
+  recursive paths: move them to a non-recursive helper or `plc_tmp_alloc()`. Operator
+  chains are left-deep trees as long as the chain: keep them iterative (`bin_chain`,
+  `X_CHAIN`, `called_walk`). Check with `-fstack-usage` and a 16 KB thread.
 - Released outputs are parked pulled to their *inactive* level, not `gpio_reset_pin`
   (which enables the pull-up). STOP drives outputs inactive.
 - State-changing API requests require `Content-Type: application/json` (CSRF guard),
@@ -124,6 +139,19 @@ with `T.model.*` so shapes match the editors). Cases are regenerated on every ru
   `s_xlock` — never do I2C inside the scan. Register protocols in `main/i2c_dev.c` (no IDF
   includes), checked against simulated chips by `test/host/test_i2c_dev.c` (run_parity).
   A module that stops answering reads 0 and is re-initialised every 0.5 s.
+- OUC: the `plc_net_t` callbacks run inside the scan with the runtime lock held —
+  memory only (`ouc_net` copies into per-connection buffers under its own mutex); every
+  socket call is in `ouc_net_poll()` on its own task. Without a driver the engine uses
+  the virtual network, like the simulator (parity tests). Status codes and the
+  DONE/BUSY/ERROR timing are part of the semantics: change `sysfb.js` and
+  `plc_sysfb.c` together.
+- Typed data: `project.types` = `[{id, name, comment, version, members}]`; a member is
+  `{id, name, dataType, default, comment, members?}` (`members` for `Struct` / `Array
+  of Struct`); a global DB has `members` or `dbType`, an instance DB `instanceOf`, both
+  `startValues: {'a.b[2]': 'literal'}`; an FC's return is `iface.return = [] |
+  [{name:'RET_VAL', dataType}]`. `project.sources = [{id, name, text}]` is never
+  downloaded (`online.js` strips it). Layout rules: `types.js` header — the C port must
+  give the same bytes (run_parity compares every DB byte by byte).
 - `project.gpio` entries: `{tag, pin, dir:'in'|'out'|'pwm'|'ain', pull, debounce,
   activeLow, freq, mode:'s7'|'raw'|'mv', smooth:0..3}`. A missing/null `pin` = unmapped.
   Pi entries carry `bcm` and are ignored.

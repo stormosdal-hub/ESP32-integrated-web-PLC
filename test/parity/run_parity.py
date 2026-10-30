@@ -27,7 +27,7 @@ CLI = os.path.join(OUT, 'plc_cli.exe' if os.name == 'nt' else 'plc_cli')
 
 def build():
     os.makedirs(OUT, exist_ok=True)
-    srcs = [os.path.join(CORE, f) for f in ('jdom.c', 'jw.c', 'plc_engine.c', 'plc_scl.c')]
+    srcs = sorted(glob.glob(os.path.join(CORE, '*.c')))
     srcs.append(os.path.join(ROOT, 'test', 'host', 'plc_cli.c'))
     cmd = ['gcc', '-std=c11', '-O2', '-g', '-Wall', '-Wextra', '-Wno-unused-parameter',
            '-I' + os.path.join(CORE, 'include'), '-I' + CORE] + srcs + ['-lm', '-o', CLI]
@@ -48,6 +48,13 @@ def build():
     subprocess.run(['gcc', '-std=c11', '-Wall', '-Wextra', '-I' + os.path.join(ROOT, 'main'),
                     os.path.join(ROOT, 'main', 'i2c_dev.c'), os.path.join(ROOT, 'test', 'host', 'test_i2c_dev.c'),
                     '-lm', '-o', exe], check=True)
+    subprocess.run([exe], check=True)
+    # OUC TCP connections (main/ouc_net.c) over real sockets on 127.0.0.1
+    exe = os.path.join(OUT, 'test_ouc_net.exe' if os.name == 'nt' else 'test_ouc_net')
+    subprocess.run(['gcc', '-std=c11', '-Wall', '-Wextra', '-I' + os.path.join(ROOT, 'main'), '-I' + os.path.join(CORE, 'include'),
+                    os.path.join(ROOT, 'main', 'ouc_net.c'), os.path.join(CORE, 'jw.c'),
+                    os.path.join(ROOT, 'test', 'host', 'test_ouc_net.c'), '-lm'] +
+                   (['-lws2_32'] if os.name == 'nt' else []) + ['-o', exe], check=True)
     subprocess.run([exe], check=True)
 
 
@@ -92,6 +99,14 @@ def compare(kase, js, c):
             cv = sc['mem'].get(k, '<missing>')
             if cv == '<missing>' or not same(v, cv):
                 errs.append('step %d: tag %s  js=%r  c=%r' % (i, k, v, cv))
+        for k in sorted(set(sj.get('dbs', {})) | set(sc.get('dbs', {}))):
+            a, b = sj.get('dbs', {}).get(k), sc.get('dbs', {}).get(k)
+            if a != b:
+                diff = next((i // 2 for i in range(0, min(len(a or ''), len(b or '')), 2) if (a or '')[i:i + 2] != (b or '')[i:i + 2]), None)
+                errs.append('step %d: DB %s differs (first at byte %s; %s vs %s bytes)' % (
+                    i, k, diff, len(a or '') // 2, len(b or '') // 2))
+        if json.dumps(sj.get('conns', []), sort_keys=True) != json.dumps(sc.get('conns', []), sort_keys=True):
+            errs.append('step %d: OUC connections js=%s c=%s' % (i, sj.get('conns'), sc.get('conns')))
         for grp in ('live', 'power', 'pins'):
             for k in sorted(set(sj[grp]) | set(sc[grp])):
                 a, b = sj[grp].get(k, False), sc[grp].get(k, False)
@@ -131,7 +146,8 @@ def main():
                 continue
             c = json.loads(res.stdout)
         errs = compare(kase, js, c)
-        nchk = sum(len(s['mem']) + len(s['live']) + len(s['power']) + len(s['pins']) for s in js['steps'])
+        nchk = sum(len(s['mem']) + len(s['live']) + len(s['power']) + len(s['pins']) +
+                   sum(len(v) // 2 for v in s.get('dbs', {}).values()) for s in js['steps'])
         if errs:
             failed += 1
             print('FAIL %-10s %d difference(s)' % (name, len(errs)))
@@ -146,7 +162,7 @@ def main():
     # a PLC is re-programmed many times without a reboot: nothing may leak
     if not args.no_build:
         leak = os.path.join(OUT, 'test_leak.exe' if os.name == 'nt' else 'test_leak')
-        srcs = [os.path.join(CORE, f) for f in ('jdom.c', 'jw.c', 'plc_engine.c', 'plc_scl.c')]
+        srcs = sorted(glob.glob(os.path.join(CORE, '*.c')))
         subprocess.run(['gcc', '-std=c11', '-O1', '-I' + os.path.join(CORE, 'include'), '-I' + CORE] + srcs +
                        [os.path.join(ROOT, 'test', 'host', 'test_leak.c'), '-lm', '-o', leak], check=True)
         with tempfile.TemporaryDirectory() as td:

@@ -1,0 +1,28 @@
+﻿TYPE "TcpLinkTxAnalog"
+VERSION : 1.1
+   STRUCT
+      // Analoge data, PLS -> PC. MÅLINGER: hvert element har sitt eget
+      // dødbånd, som gis til TcpLink som en egen variabel av akkurat denne
+      // typen.
+      //
+      //   dødbånd 0    diskret. Enhver endring sendes med en gang.
+      //                Trinnummer, tilstandskoder, tellere, settpunkter.
+      //   dødbånd >0   analog. Må flytte seg så mye OG vente ut
+      //                analogMinInterval. Alt som flakker.
+      //
+      // Send Reals som Reals -- ingen fastkommaskalering, ingen overflyt i
+      // REAL_TO_INT å passe seg for. En Real med dødbånd 0 sammenlignes
+      // eksakt, og for en levende måling betyr det en sending hver syklus.
+      //
+      // ENDRE STØRRELSE: endre grensene her, ingenting annet. Hver array
+      // trenger minst ett element og høyst 255. Dødbåndvariabelen er av
+      // samme type, så den følger med automatisk.
+      // Endre bare den ØVRE grensen. Arrayene starter på 0, og navn, typer
+      // og rekkefølge på medlemmene beholdes: blokken og formatet på linjen
+      // avhenger av dem.
+
+      ints  : Array[0..15] of Int;    // 16-bits verdier
+      dints : Array[0..7] of DInt;    // tellere, kilometertellere, driftstider
+      reals : Array[0..7] of Real;    // hastighet, moment, strøm, temperatur
+   END_STRUCT;
+END_TYPE

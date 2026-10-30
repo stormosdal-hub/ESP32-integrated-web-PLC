@@ -6,7 +6,8 @@ same C engine (components/plc_core) through ctypes — so you can write,
 download, run and monitor programs with no ESP32 attached. GPIO-mapped inputs
 read like unwired pins (FALSE / 0); drive them by toggling them in the IDE's
 Simulation table while monitoring — that forces them, exactly like on the
-device (the momentary button forces only while held).
+device (the momentary button forces only while held). TCON / TSEND / TRCV open
+real TCP connections from this PC (main/ouc_net.c, as on the ESP32).
 
     python tools/plc_emulator.py               # http://localhost:8080
     python tools/plc_emulator.py --port 8000
@@ -31,7 +32,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 WEB = os.path.join(ROOT, 'web')
@@ -47,15 +48,21 @@ MIME = {'.html': 'text/html; charset=utf-8', '.js': 'application/javascript; cha
 
 # --------------------------------------------------------------- engine ----
 def build_lib():
-    srcs = [os.path.join(CORE, f) for f in ('jdom.c', 'jw.c', 'plc_engine.c', 'plc_scl.c')]
-    srcs.append(os.path.join(ROOT, 'tools', 'emulator', 'plc_emu.c'))
-    newest = max(os.path.getmtime(p) for p in srcs + glob.glob(os.path.join(CORE, '**', '*.h'), recursive=True))
+    # the engine + the TCP connections behind TCON/TSEND/TRCV (main/ouc_net.c, as on the ESP32)
+    mdir = os.path.join(ROOT, 'main')
+    srcs = sorted(glob.glob(os.path.join(CORE, '*.c')))
+    srcs += [os.path.join(ROOT, 'tools', 'emulator', 'plc_emu.c'), os.path.join(mdir, 'ouc_net.c')]
+    hdrs = glob.glob(os.path.join(CORE, '**', '*.h'), recursive=True) + [os.path.join(mdir, 'ouc_net.h')]
+    newest = max(os.path.getmtime(p) for p in srcs + hdrs)
     if os.path.exists(LIB) and os.path.getmtime(LIB) >= newest:
         return
     os.makedirs(OUT, exist_ok=True)
-    cmd = ['gcc', '-std=c11', '-O2', '-shared', '-I' + os.path.join(CORE, 'include'), '-I' + CORE] + srcs + ['-lm', '-o', LIB]
-    if os.name != 'nt':
+    cmd = ['gcc', '-std=c11', '-O2', '-shared', '-I' + os.path.join(CORE, 'include'), '-I' + CORE, '-I' + mdir] + srcs + ['-lm']
+    if os.name == 'nt':
+        cmd.append('-lws2_32')
+    else:
         cmd.insert(1, '-fPIC')
+    cmd += ['-o', LIB]
     print('building engine:', os.path.basename(LIB))
     subprocess.run(cmd, check=True)
 
@@ -69,12 +76,16 @@ class Engine:
         vp, cp = ctypes.c_void_p, ctypes.c_char_p
         L.emu_load.restype = vp
         L.emu_load.argtypes = [cp, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
-        for f in ('emu_free', 'emu_unforce'):
+        for f in ('emu_free', 'emu_unforce', 'emu_comm_reset'):
             getattr(L, f).argtypes = [vp]
         L.emu_cycle.argtypes = [vp, ctypes.c_double]
-        for f in ('emu_snapshot', 'emu_tags', 'emu_warnings', 'emu_io', 'emu_srs', 'emu_i2c'):
+        for f in ('emu_snapshot', 'emu_tags', 'emu_warnings', 'emu_io', 'emu_srs', 'emu_i2c', 'emu_conns'):
             getattr(L, f).restype = vp
             getattr(L, f).argtypes = [vp]
+        L.emu_sockets.restype = vp
+        L.emu_sockets.argtypes = []
+        L.emu_dbs.restype = vp
+        L.emu_dbs.argtypes = [vp, cp]
         L.emu_modbus_map.restype = vp
         L.emu_modbus_map.argtypes = [vp, ctypes.c_int]
         L.emu_free_str.argtypes = [vp]
@@ -94,8 +105,8 @@ class Engine:
         h = self.L.emu_load(raw, len(raw), err, 256)
         return h, err.value.decode('utf-8', 'replace')
 
-    def json(self, fn, h, *args):
-        p = getattr(self.L, fn)(h, *args)
+    def json(self, fn, *args):
+        p = getattr(self.L, fn)(*args)
         if not p:
             return None
         try:
@@ -580,11 +591,17 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/state':
                 snap = e.json('emu_snapshot', h) or {}
                 snap.update({'running': rt.running, 'programRev': rt.rev, 'cycle': dict(rt.stats, scanMs=e.L.emu_scan_ms(h))})
+                dbs = (parse_qs(urlparse(self.path).query).get('dbs') or [''])[0]
+                if dbs:  # the named data blocks' bytes (hex) for the IDE's DB view
+                    snap['dbs'] = e.json('emu_dbs', h, dbs.encode('utf-8')) or {}
                 return self._send(200, snap)
             if path == '/api/tags':
                 return self._send(200, {'ok': True, 'programRev': rt.rev, 'tags': e.json('emu_tags', h) or []})
             if path == '/api/modbus-map':
                 return self._send(200, {'ok': True, 'port': None, 'bank': BANK, 'map': e.json('emu_modbus_map', h, BANK) or {}})
+            if path == '/api/ouc':
+                # the program's TCON connections + the real sockets behind them
+                return self._send(200, {'ok': True, 'conns': e.json('emu_conns', h) or [], 'sockets': e.json('emu_sockets') or []})
             if path == '/api/program':
                 if not rt.text:
                     return self._err(404, 'no program stored on the PLC')
@@ -651,7 +668,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {'ok': True})
             if path in ('/api/run', '/api/stop'):
                 with rt.lock:
+                    was = rt.running
                     rt.running = (path == '/api/run') and rt.has_program
+                    if was and not rt.running:
+                        e.L.emu_comm_reset(rt.h)  # STOP drops the TCP connections, like the PLC
                     return self._send(200, {'ok': True, 'running': rt.running})
             if path == '/api/wifi':
                 return self._send(200, {'ok': True, 'restarting': False})

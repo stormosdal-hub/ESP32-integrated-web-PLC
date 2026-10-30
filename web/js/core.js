@@ -254,6 +254,7 @@ window.TIA = window.TIA || {};
     newInterface(type) {
       const i = { input: [], output: [], inout: [], temp: [], constant: [] };
       if (type === 'FB') i.static = [];
+      if (type === 'FC') i.return = [];      // [] = Void, or [{name:'RET_VAL', dataType}]
       return i;
     },
     newMember(name, dataType, def, comment) {
@@ -325,11 +326,12 @@ window.TIA = window.TIA || {};
     b.iface = b.iface || T.model.newInterface(b.type);
     ['input', 'output', 'inout', 'temp', 'constant'].forEach((s) => { b.iface[s] = b.iface[s] || []; });
     if (b.type === 'FB') b.iface.static = b.iface.static || [];
+    if (b.type === 'FC') b.iface.return = b.iface.return || [];
   };
   // The interface sections that exist for a given block type, in display order.
   T.ifaceSections = function (type) {
     if (type === 'FB') return ['input', 'output', 'inout', 'static', 'temp', 'constant'];
-    if (type === 'FC') return ['input', 'output', 'inout', 'temp', 'constant'];
+    if (type === 'FC') return ['input', 'output', 'inout', 'temp', 'constant', 'return'];
     return ['temp', 'constant'];   // OB
   };
   // Parameters carried on a call box. inout appears on BOTH sides (read in, write out).
@@ -339,7 +341,7 @@ window.TIA = window.TIA || {};
   };
   T.ifaceCallOutputs = function (b) {
     const i = (b && b.iface) || {};
-    return (i.output || []).concat(i.inout || []);
+    return (i.output || []).concat(i.inout || []).concat(b && b.type === 'FC' ? (i.return || []) : []);
   };
   // Every declared member of a block (across all sections), with its section tag.
   T.ifaceMembers = function (b) {
@@ -498,21 +500,43 @@ window.TIA = window.TIA || {};
     words: Object.create(null),     // non-area numeric cells
     bytes: null,                    // area byte stores, built in reset()
     _touched: null,                 // area addresses seen (for the sim table)
+    // Block instances, FC frames and DBs are typed byte buffers (types.js):
+    //   dbs : instance key -> { buf: Uint8Array, t: type, sig, refs }
+    //   locs: UPPERCASE operand key ('@INST:MEMBER', '@DB:A.B[2]') -> { db, off, bit, t }
+    // so an interface member / DB element is read and written through the
+    // same getBit/getWord/setBit/setWord as every other operand.
+    dbs: null,
+    locs: null,
     reset() {
       this.bits = Object.create(null);
       this.words = Object.create(null);
       this.bytes = { I: Object.create(null), Q: Object.create(null), M: Object.create(null) };
       this._touched = Object.create(null);
+      this.dbs = Object.create(null);
+      this.locs = Object.create(null);
     },
     areaKeys() { return Object.keys(this._touched); },
+    readLoc(L) {
+      const d = this.dbs[L.db];
+      if (!d) return L.t.cls === 'bool' ? false : 0;
+      return T.types.read(d.buf, L.off, L.bit, L.t);
+    },
+    writeLoc(L, v) {
+      const d = this.dbs[L.db];
+      if (d) T.types.write(d.buf, L.off, L.bit, L.t, T.types.conv(v, L.t));
+    },
     getBit(addr) {
       const k = String(addr).toUpperCase();
+      const L = this.locs[k];
+      if (L) { const v = this.readLoc(L); return typeof v === 'boolean' ? v : v !== 0; }
       const m = MEM_BIT.exec(k);
       if (m) return !!(((this.bytes[m[1]][+m[2]] || 0) >> +m[3]) & 1);
       return !!this.bits[k];
     },
     setBit(addr, v) {
       const k = String(addr).toUpperCase();
+      const L = this.locs[k];
+      if (L) { this.writeLoc(L, !!v); return; }
       const m = MEM_BIT.exec(k);
       if (m) {
         const a = this.bytes[m[1]], by = +m[2], bi = +m[3];
@@ -525,6 +549,8 @@ window.TIA = window.TIA || {};
     },
     getWord(addr) {
       const k = String(addr).toUpperCase();
+      const L = this.locs[k];
+      if (L) { const v = this.readLoc(L); return typeof v === 'boolean' ? (v ? 1 : 0) : v; }
       const m = MEM_WBD.exec(k);
       if (m) {
         const a = this.bytes[m[1]], off = +m[3];
@@ -548,6 +574,8 @@ window.TIA = window.TIA || {};
       const k = String(addr).toUpperCase();
       let n = +v;
       if (!isFinite(n)) n = 0;
+      const L = this.locs[k];
+      if (L) { this.writeLoc(L, n); return; }
       const m = MEM_WBD.exec(k);
       if (m) {
         const a = this.bytes[m[1]], off = +m[3];
@@ -626,12 +654,25 @@ window.TIA = window.TIA || {};
     // raw address
     if (ADDR_BIT.test(raw)) return { type: 'bit', addr: raw.toUpperCase(), raw };
     if (ADDR_WORD.test(raw)) return { type: 'word', addr: raw.toUpperCase(), raw };
+    // TIA spellings: #member (local), "Tag" (global)
+    if (raw.charAt(0) === '#' && /^#[A-Za-z_]\w*$/.test(raw)) raw = raw.slice(1);
+    else if (/^"[^"]+"$/.test(raw)) raw = raw.slice(1, -1);
     // local interface member (only while a block is executing) — shadows global tags
     if (T._scope) {
       const key = raw.toLowerCase();
       if (Object.prototype.hasOwnProperty.call(T._scope, key)) {
         const m = T._scope[key];
+        if (m.complex) return { type: 'none', raw, scoped: true };
         return { type: m.bit ? 'bit' : 'word', addr: m.addr, raw, scoped: true };
+      }
+    }
+    // a path into a structured member or a data block: "Data".values[3], #rec.flag
+    if (/[.\[]/.test(raw) && T.resolvePath) {
+      const L = T.resolvePath(raw);
+      if (L) {
+        if (L.t.k !== 'el') return { type: 'none', raw };
+        T.mem.locs[L.key] = { db: L.db, off: L.off, bit: L.bit, t: L.t };
+        return { type: L.t.cls === 'bool' ? 'bit' : 'word', addr: L.key, raw, loc: true };
       }
     }
     // symbolic tag (exact first, then case-insensitive — matches the ESP32 runtime)
