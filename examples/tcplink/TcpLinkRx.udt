@@ -1,0 +1,38 @@
+﻿TYPE "TcpLinkRx"
+VERSION : 1.1
+   STRUCT
+      // Det PC-en sendte, pakket ut. Produseres av TcpLink -- logikken din
+      // LESER bare denne. INDEKSEN er kontrakten.
+      //
+      //   bits[i]    NIVÅET. Holder seg fra syklus til syklus til PC-en
+      //              endrer det. Frigivelser, moduser, forriglinger,
+      //              hold-for-å-kjøre.
+      //   pulse[i]   TRUE i nøyaktig ÉN SYKLUS på den stigende flanken til
+      //              bits[i]. Start, stopp, kvittering, trinn. To visninger
+      //              av den samme biten, ikke to separate signaler.
+      //
+      // For en fallende flanke: sett din egen F_TRIG på bits[i].
+      //
+      // Alt her nullstilles når PC-en er stille i rxTimeout (med
+      // clearOnTimeout). Reals kommer utenfra PLS-en: sjekk at de er
+      // innenfor området før de når noe som beveger seg.
+      //
+      // ENDRE STØRRELSE: endre grensene her, ingenting annet. Hold antall
+      // bits til et multiplum av 16, pulse like stor som bits, og hver array
+      // på minst 1 og høyst 255 elementer.
+      // Endre bare den ØVRE grensen. Arrayene starter på 0, og navn, typer
+      // og rekkefølge på medlemmene beholdes: blokken og formatet på linjen
+      // avhenger av dem.
+      //
+      // REKKEFØLGEN BETYR NOE: alt over pulse er formatet på linjen, i denne
+      // rekkefølgen. pulse regnes ut i PLS-en og sendes aldri, så den må
+      // ligge SIST.
+
+      bits  : Array[0..15] of Bool;
+      words : Array[0..3] of Word;
+      ints  : Array[0..11] of Int;
+      dints : Array[0..3] of DInt;
+      reals : Array[0..3] of Real;
+      pulse : Array[0..15] of Bool;   // stigende flanke på bits[], én syklus
+   END_STRUCT;
+END_TYPE

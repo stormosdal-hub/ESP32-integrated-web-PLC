@@ -2661,3 +2661,12 @@ void plc_modbus_map_json(const plc_t *p, jw_t *w, unsigned bank)
         }
     jw_obj_end(w);
 }
+
+/* ---------------------------------------------------------------- OUC (stubs until the OUC engine lands) */
+void plc_comm_reset(plc_t *p) { (void)p; }
+void plc_conns_json(plc_t *p, jw_t *w)
+{
+    (void)p;
+    jw_arr(w);
+    jw_arr_end(w);
+}

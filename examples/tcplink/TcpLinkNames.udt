@@ -1,0 +1,37 @@
+TYPE "TcpLinkNames"
+VERSION : 1.0
+   STRUCT
+      // Navnene til plassene i TcpLink, sendt til klienten som én melding
+      // (kind 1) ved hver tilkobling og på en flanke på resendNames.
+      //
+      // Rekonstruert for ESP32 Web PLC fra beskrivelsen i TcpLink: en header
+      // på 32 byte og deretter én String-array per seksjon, i layoutrekkefølgen.
+      // Med standardstørrelsene er typen 2584 byte. En navnearray kan være
+      // kortere enn dataarrayen sin (resten er uten navn), og strenglengden
+      // må være et partall (String[20] -> 22 byte, ingen fyllbyte).
+      //
+      // TcpLink skriver bare hdr. Navnene fyller du inn som startverdier i
+      // DB-en (se TcpLinkDemo.db).
+      hdr : Struct
+         magic : Byte;                  // 16#A5
+         ver : Byte;                    // 7
+         len : UInt;                    // byte i hele meldingen
+         seq : UInt;
+         flags : Byte;
+         kind : Byte;                   // 1 = navn
+         layout : Array[0..11] of Byte; // antall navn per seksjon
+         spare : Array[0..11] of Byte;
+      END_STRUCT;
+      txBits : Array[0..31] of String[20];
+      txWords : Array[0..7] of String[20];
+      txTimes : Array[0..3] of String[20];
+      txInts : Array[0..15] of String[20];
+      txDints : Array[0..7] of String[20];
+      txReals : Array[0..7] of String[20];
+      rxBits : Array[0..15] of String[20];
+      rxWords : Array[0..3] of String[20];
+      rxInts : Array[0..11] of String[20];
+      rxDints : Array[0..3] of String[20];
+      rxReals : Array[0..3] of String[20];
+   END_STRUCT;
+END_TYPE

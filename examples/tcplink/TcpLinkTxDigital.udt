@@ -1,0 +1,33 @@
+﻿TYPE "TcpLinkTxDigital"
+VERSION : 1.1
+   STRUCT
+      // Digitale data, PLS -> PC. HENDELSER: sendes i det øyeblikket de
+      // endres -- ingen dødbånd, ingen tidsgrense.
+      //
+      // INDEKSEN er kontrakten på linjen, betydningen er din. Gi plassene
+      // navn der du kaller TcpLink, ikke her, så denne typen er den samme
+      // i alle prosjekter.
+      //
+      // ENDRE STØRRELSE: endre grensene her, ingenting annet. TcpLink leser
+      // størrelsene fra denne typen og oppgir dem i headeren på hver melding.
+      // Hold antall bits til et multiplum av 16 (16, 32, 48, 64 ...); hver
+      // array trenger minst ett element og høyst 255.
+      // Endre bare den ØVRE grensen. Arrayene starter på 0, og navn, typer
+      // og rekkefølge på medlemmene beholdes: blokken og formatet på linjen
+      // avhenger av dem.
+
+      bits  : Array[0..31] of Bool;   // tilstander, alarmer, endebrytere
+      words : Array[0..7] of Word;    // statusord, feilkoder, bitmasker
+
+      // Tidsstempler som PC-en kan regne med: siste feil, siste start,
+      // siste gang noe beveget seg. Bruk samme klokke som tidsstempelet i
+      // headeren (UTC, eller lokal tid med useLocalTime), så de kan trekkes
+      // fra hverandre.
+      //
+      // Sammenlignes ned til SEKUNDET, ikke nanosekundet. En tid som settes
+      // én gang ved en hendelse, går ut med en gang; en som skrives på nytt
+      // hver syklus mens noe går, går ut høyst én gang i sekundet i stedet
+      // for hver syklus.
+      times : Array[0..3] of DTL;
+   END_STRUCT;
+END_TYPE

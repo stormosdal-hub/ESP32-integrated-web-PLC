@@ -1,0 +1,985 @@
+﻿FUNCTION "TcpLinkCount" : Int
+VERSION : 1.0
+
+// ---------------------------------------------------------------------
+// Hjelpefunksjon for TcpLink: antall elementer i en array.
+//
+// CountOfElements tar en VARIANT, så denne FC-en er adapteren som lar
+// TcpLink gi den vanlige arrayer fra UDT-ene sine. Det er dette som lar
+// TcpLink lese størrelsene sine fra UDT-ene: endre størrelsen på en array
+// der, og blokken følger med ved neste kompilering.
+//
+// Returnerer 0 hvis argumentet ikke er en array.
+// ---------------------------------------------------------------------
+
+VAR_INPUT
+   arr : Variant;
+END_VAR
+
+#TcpLinkCount := UDINT_TO_INT(CountOfElements(#arr));
+
+END_FUNCTION
+
+
+FUNCTION_BLOCK "TcpLink"
+{ S7_Optimized_Access := 'FALSE' }
+VERSION : 1.4
+
+// ---------------------------------------------------------------------
+// Generell toveis link: PLS <-> en hvilken som helst datamaskin, over én
+// TCP-forbindelse.
+//
+// Motoren fra KjoreverkLink med alt applikasjonsspesifikt tatt ut. Blokken
+// kjenner tre former for data og ingenting om hva de betyr:
+//
+//   "TcpLinkTxDigital"  bits, words, times   PLS -> PC   hendelser
+//   "TcpLinkTxAnalog"   ints, dints, reals   PLS -> PC   med dødbånd
+//   "TcpLinkRx"         bits, words, ints,   PC -> PLS   kommandoer,
+//                       dints, reals                     settpunkter
+//
+// Hvilken plass som er en hastighet og hvilken som er en feilkode,
+// bestemmes der blokken kalles. De samme tre typene dekker alle prosjekter.
+//
+// Hva hver plass HETER, ligger i en fjerde type, "TcpLinkNames", som sendes
+// til klienten én gang per forbindelse (og igjen på en flanke på
+// resendNames). CPU-en har ingen egne tagnavn mens den kjører, så navn når
+// bare fram til klienten hvis de er lagret som strenger.
+//
+// HISTORIKKEN (en retentiv ringbuffer, "TcpLinkHistory", kind 2) er tatt
+// ut i denne utgaven for ESP32 Web PLC: ESP32-en har ikke retentivt minne.
+// Klienten skal tåle at den aldri får en kind 2-melding.
+//
+// STØRRELSENE KOMMER FRA UDT-ENE. Alle løkkegrenser, begge meldingslengder
+// og layoutbytene nedenfor leses fra UDT-ene via TcpLinkCount. For å sende
+// mer av noe: endre UDT-en og kompiler på nytt -- ingenting her inne endres,
+// og klienten leser de nye størrelsene fra headeren.
+//
+// PLS-en er den PASSIVE siden: den lytter på localPort, og klienten kobler
+// seg til. Flere instanser kan kjøre side om side, hver med sin egen
+// connId og localPort.
+//
+// =====================================================================
+// MELDING PLS -> PC, format 7. 196 byte med standardstørrelsene.
+//
+//   byte  0      magic   16#A5
+//   byte  1      ver     7
+//   byte  2..3   len     UInt, antall byte i hele meldingen
+//   byte  4..5   seq     UInt, +1 per melding
+//   byte  6      flags   bit 0 = tidsstemplene er lokal tid, ellers UTC
+//   byte  7      kind    0 = data (denne meldingen), 1 = navn, 2 = historikk
+//   byte  8..19  layout  12 x Byte, se under
+//   byte 20..31  ts      DTL, PLS-klokka da meldingen ble bygd
+//   byte 32..    txDigital, så txAnalog, nøyaktig slik de ligger i
+//                UDT-ene: bits, words, times, ints, dints, reals
+//
+//   Med standardstørrelsene:
+//     32..35   bits   32      36..51   words   8      52..99   times  4
+//    100..131  ints   16     132..163  dints   8     164..195  reals  8
+//
+// LAYOUT -- headeren beskriver innholdet, så en klient trenger ingen
+// konfigurasjon for å dekode det, og en UDT med ny størrelse kan ikke bli
+// lest feil i det stille i andre enden. Seks byte per retning, i samme
+// rekkefølge som innholdet:
+//
+//   layout[0]  tx bit-BYTE (bits rundet opp til hele words)
+//   layout[1]  tx words      layout[2]  tx times
+//   layout[3]  tx ints       layout[4]  tx dints     layout[5]  tx reals
+//   layout[6]  rx bit-BYTE
+//   layout[7]  rx words      layout[8]  rx times (alltid 0 foreløpig)
+//   layout[9]  rx ints       layout[10] rx dints     layout[11] rx reals
+//
+// [6..11] er det denne PLS-en forventer å MOTTA. En klient leser den
+// første meldingen og bygger deretter kommandorammer som passer.
+//
+// =====================================================================
+// NAVN, kind 1 -- PLS -> PC, én gang per forbindelse, FØR den første
+// datameldingen, og igjen på hver stigende flanke på resendNames. 2584 byte
+// med standardstørrelsene. Det er "TcpLinkNames"-DB-en til den som kaller
+// blokken, sendt slik den ligger i minnet:
+//
+//   byte  0..7   magic, ver, len, seq, flags = 0, kind = 1 -- som over,
+//                og seq er den samme telleren som for datameldingene
+//   byte  8..19  layout  12 x Byte: hvor mange NAVN hver seksjon har, i
+//                samme rekkefølge som datalayouten. En navnearray kan være
+//                kortere enn dataarrayen sin; resten er uten navn.
+//   byte 20..31  spare   0
+//   byte 32..    S7-strenger, seksjon etter seksjon: hver av dem er
+//                [maks lengde][nåværende lengde][maks lengde x tegn]
+//
+// Den gjentas aldri av seg selv: klienten får strengene på nytt bare ved
+// en ny forbindelse eller en flanke på resendNames.
+//
+// =====================================================================
+// KOMMANDORAMME PC -> PLS, format 3. 80 byte med standardstørrelsene.
+//
+//   byte  0      magic   16#5A   (med vilje ikke 16#A5, så en ramme
+//                                 som går feil vei, er lett å se)
+//   byte  1      ver     3
+//   byte  2..3   len     UInt, antall byte totalt
+//   byte  4..5   seq     UInt, +1 per melding fra PC-en
+//   byte  6      flags   reservert, 0
+//   byte  7      spare   0
+//   byte  8..13  layout  6 x Byte, en kopi av layout[6..11] fra PLS-en
+//   byte 14..    bits, words, ints, dints, reals -- "TcpLinkRx" fram til,
+//                men ikke med, pulse
+//
+//   Med standardstørrelsene:
+//     14..15  bits   16       16..23  words   4      24..47   ints   12
+//     48..63  dints   4       64..79  reals   4
+//
+// RAMMEINNDELINGEN VIRKER ANNERLEDES PÅ DENNE SIDEN, og det er verdt å
+// vite hvorfor. TRCV med fast LEN venter til nøyaktig LEN byte har kommet
+// før den setter NDR, og det gir rammeinndeling gratis -- men hvis
+// strømmen noen gang kommer ut av takt, finnes det ingen måte å lete etter
+// headeren slik klienten gjør. Derfor sjekkes headeren i hver ramme, og en
+// dårlig ramme bryter forbindelsen med vilje. Tilstandsmaskinen kobler så
+// opp igjen innen reconnectDelay. Ute av takt blir et blaff på to sekunder
+// i stedet for søppel for alltid. rxBadReason sier hvilken sjekk som feilet.
+//
+// TIMEOUT PÅ MOTTAK -- en sikkerhetsbeslutning, ikke en detalj.
+// En mottatt verdi blir liggende i minnet for alltid. Hvis klienten krasjer
+// eller nettverket faller ut, ville det siste kommanderte settpunktet bli
+// stående på ubestemt tid. Derfor går rxStale TRUE hvis ingenting kommer
+// innen rxTimeout, og når clearOnTimeout er satt, nullstilles alle mottatte
+// nivåer og verdier. Standard er PÅ. Slå det av bare hvis din egen logikk
+// følger med på rxStale og gjør noe bedre.
+//
+// =====================================================================
+// REGLER FOR SENDING (PLS -> PC)
+//
+//   txDigital.bits[], txDigital.words[]
+//       eksakt sammenligning, sendes i det øyeblikket de endres. Hendelser.
+//   txDigital.times[]
+//       sammenlignes ned til sekundet, sendes i det øyeblikket de endres.
+//       En tid som skrives på nytt hver syklus, går derfor ut høyst én gang
+//       i sekundet.
+//   txAnalog-element med dødbånd <= 0
+//       diskret. Enhver endring sendes med en gang.
+//   txAnalog-element med dødbånd > 0
+//       må flytte seg så mye OG vente ut analogMinInterval, ellers sender
+//       en verdi som flakker, hver eneste syklus.
+//   heartbeat
+//       etter 'heartbeat' med fullstendig stillhet.
+//   navn
+//       én gang per forbindelse, før den første datameldingen, og igjen på
+//       en flanke på resendNames. Sammenlignes aldri, gjentas aldri ellers.
+//
+// TILSTANDSMASKIN FOR FORBINDELSEN
+//   0 IDLE           venter ut reconnectDelay før neste forsøk
+//   1 CONNECTING     TCON er bestilt, venter på DONE eller ERROR
+//   2 CONNECTED      sender og mottar
+//   3 DISCONNECTING  TDISCON er bestilt, venter på at den blir ferdig
+//
+// Alle veier tilbake til en ny forbindelse går gjennom DISCONNECTING, TCON
+// bestilles aldri mens TDISCON er opptatt, og nye forsøk gjentas på en
+// timer i stedet for på én enkelt flanke.
+//
+// TIMERE -- alle nullstilles av en hendelse, aldri av sin egen utgang, så
+// betingelsene deres er nivåer og ikke pulser på én syklus:
+//   sinceSend.ET   tid siden siste sendte melding
+//   sinceTry.ET    tid siden siste forsøk på å koble til
+//   sinceRx.ET     tid siden siste mottatte ramme
+//
+// Blokken MÅ forbli ikke-optimert: formatet på linjen avhenger av at
+// byte-offsetene ligger fast.
+// ---------------------------------------------------------------------
+
+VAR_INPUT
+   txDigital : "TcpLinkTxDigital";  // bits, words, times, PLS -> PC
+   txAnalog  : "TcpLinkTxAnalog";   // ints, dints, reals, PLS -> PC
+
+   // Senderegel per element, i samme form som txAnalog, så hver verdi har
+   // dødbåndet sitt på samme indeks, og de to kan ikke gli fra hverandre.
+   //   <=0 = diskret, enhver endring sendes med en gang
+   //   >0  = analog, må flytte seg så mye og vente ut tidsgrensen
+   deadband : "TcpLinkTxAnalog";
+
+   enable : Bool := TRUE;           // FALSE lukker linken, og den holdes nede
+   resetStats : Bool := FALSE;      // TRUE nullstiller diagnosetellerne
+
+   // Navnene går ut av seg selv når en klient kobler til. En stigende
+   // flanke her sender dem på nytt til klienten som allerede er tilkoblet --
+   // for eksempel etter at nye navn er lastet ned. Ignoreres når ingen er det.
+   resendNames : Bool := FALSE;
+
+
+   // --- forbindelse -------------------------------------------------
+   // Leses når en forbindelse åpnes. Slå enable av og på for å ta i bruk en endring.
+   connId : CONN_OUC := 16#1;       // unik blant alle OUC-blokker i CPU-en
+   localPort : UInt := 2000;        // unik per instans, klienten kobler til her
+   hwInterface : HW_ANY := 16#40;   // 64, PROFINET-grensesnittet til CPU-en
+
+   // --- PLS-klokka i headeren -----------------------------------------
+   // Som standard leser blokken CPU-klokka selv, i det øyeblikket hver
+   // melding bygges. Sett useExtTime for å stemple din egen DTL i stedet.
+   useExtTime : Bool := FALSE;      // TRUE stempler extTime i stedet for å lese klokka
+   extTime : DTL;                   // din egen klokke, leses bare med useExtTime
+   // Forteller klienten hvordan ALLE DTL-er i meldingen skal leses -- headeren
+   // og txDigital.times[]. FALSE = UTC, TRUE = lokal tid. Uten useExtTime
+   // velger den også hvilken klokke som leses: RD_SYS_T eller RD_LOC_T.
+   useLocalTime : Bool := FALSE;
+
+   // --- innstillinger -----------------------------------------------
+   heartbeat : Time := T#1s;        // lengste stillhet før en keepalive går ut
+   reconnectDelay : Time := T#2s;   // pause mellom forsøk på å koble til
+   analogMinInterval : Time := T#100ms;  // minste tid mellom analoge sendinger
+
+   // --- sikkerhet på mottak -----------------------------------------
+   rxTimeout : Time := T#2s;        // ingenting mottatt så lenge = foreldet
+   clearOnTimeout : Bool := TRUE;   // nullstill alt mottatt når det er foreldet
+END_VAR
+
+VAR_IN_OUT
+   // In/out og ikke input, med vilje: en input ville kopiert hver streng inn
+   // i instans-DB-en ved hvert kall. In/out sender en referanse, TSEND sender
+   // rett fra DB-en din, og navnene finnes bare én gang i minnet.
+   // Blokken skriver bare til names.hdr.
+   names : "TcpLinkNames";
+
+END_VAR
+
+VAR_OUTPUT
+   rx : "TcpLinkRx";                // det PC-en sendte -- les denne
+
+   connected  : Bool;               // TRUE mens en klient er tilkoblet
+   linkState  : Int;                // 0 hviler, 1 kobler til, 2 oppe, 3 kobler fra
+   rxStale    : Bool;               // ingenting mottatt innen rxTimeout
+   rxFresh    : Bool;               // én syklus, en ny ramme kom akkurat inn
+
+   tconStatus : Word;               // statusord fra TCON, levende
+   sendStatus : Word;               // statusord fra TSEND, levende
+   recvStatus : Word;               // statusord fra TRCV, levende
+   timeStatus : Int;                // returverdi fra siste klokkelesing, 0 = ok
+
+   txCount      : UDInt;            // alle meldinger sendt
+   hbSends      : UDInt;            // ... av dem bare heartbeat
+   changeSends  : UDInt;            // ... av dem utløst av ekte data
+   blockedScans : UDInt;            // ønsket å sende, TSEND var opptatt
+   connAttempts : UDInt;            // antall TCON-bestillinger
+   rxCount      : UDInt;            // gyldige rammer mottatt
+   rxBadFrames  : UDInt;            // rammer som feilet headersjekken
+   rxGaps       : UDInt;            // hull i sekvensnumrene fra PC-en
+   sendErrors   : UDInt;            // feilflanker fra TSEND
+   recvErrors   : UDInt;            // feilflanker fra TRCV
+   tconErrors   : UDInt;            // feilflanker fra TCON
+
+   lastGap : Time;                  // tid mellom de to siste sendte meldingene
+   maxGap  : Time;                  // lengste tid siden nullstilling
+   rxGap   : Time;                  // tid mellom de to siste mottatte rammene
+   lastSendError : Word;            // låst, overlever at STATUS går tilbake til 7000
+   lastRecvError : Word;            // låst
+   lastTconError : Word;            // låst
+   rxBadReason : Int;               // låst: 1 magic/ver, 2 len, 3 layout
+
+   txLen : UInt;                    // størrelse på meldingen PLS -> PC, fra UDT-ene
+   rxLen : UInt;                    // størrelse på kommandorammen PLS-en forventer
+
+   namesSent   : UDInt;             // navnemeldinger levert
+   namesStatus : Int;               // siste forsøk: 0 ok, 1 en navnearray er lengre
+                                    // enn dataarrayen sin (sendt likevel), 2 for stor
+                                    // for én melding, 3 odde strenglengde (2, 3 =
+                                    // ikke sendt)
+
+END_VAR
+
+VAR
+   connParam : TCON_IP_v4;
+   conInst    : TCON;
+   disconInst : TDISCON;
+   sendInst   : TSEND;
+   recvInst   : TRCV;
+   sendErrEdge : R_TRIG;
+   recvErrEdge : R_TRIG;
+   tconErrEdge : R_TRIG;
+   resendEdge  : R_TRIG;
+
+   sinceSend : TON_TIME;            // eldre TIA: bruk TON eller IEC_TIMER
+   sinceTry  : TON_TIME;
+   sinceRx   : TON_TIME;
+
+   txMsg : Struct
+      magic  : Byte;                // offset  0
+      ver    : Byte;                // offset  1
+      len    : UInt;                // offset  2
+      seq    : UInt;                // offset  4
+      flags  : Byte;                // offset  6
+      kind   : Byte;                // offset  7, alltid KIND_DATA her
+      layout : Array[0..11] of Byte;  // offset 8 .. 19
+      ts     : DTL;                 // offset 20 .. 31
+      dig    : "TcpLinkTxDigital";  // offset 32 ..
+      ana    : "TcpLinkTxAnalog";   // rett etter dig
+   END_STRUCT;
+
+   rxMsg : Struct
+      magic  : Byte;                // offset  0
+      ver    : Byte;                // offset  1
+      len    : UInt;                // offset  2
+      seq    : UInt;                // offset  4
+      flags  : Byte;                // offset  6
+      spare  : Byte;                // offset  7
+      layout : Array[0..5] of Byte; // offset  8 .. 13
+      // TRCV fyller denne fram til rxLen, som slutter rett før data.pulse.
+      // pulse er aldri på linjen: blokken skriver flankene inn i den og
+      // gir fra seg hele strukturen i én tilordning.
+      data   : "TcpLinkRx";         // offset 14 ..
+   END_STRUCT;
+
+   rxZero : "TcpLinkRx";            // skrives aldri: alt FALSE og 0, for nullstilling
+
+   prevDig : "TcpLinkTxDigital";    // det som gikk ut i forrige melding
+   prevAna : "TcpLinkTxAnalog";
+
+   state     : Int;                 // 0 hviler, 1 kobler til, 2 oppe, 3 kobler fra
+   reqCon    : Bool;                // REQ holdt for TCON
+   reqDis    : Bool;                // REQ holdt for TDISCON
+   everTried : Bool;                // hopper over ventetiden ved aller første forsøk
+   tryJustNow : Bool;               // én syklus lang, nullstiller sinceTry
+   rxJustNow  : Bool;               // én syklus lang, nullstiller sinceRx
+   badFrame   : Bool;               // en dårlig ramme tvinger fram ny tilkobling
+   everRx     : Bool;               // en første ramme har ingen forrige seq
+   prevRxSeq  : UInt;
+
+   linkUp    : Bool;                // intern kopi av "connected"
+   firstSend : Bool;                // tvinger fram én melding etter tilkobling
+   justSent  : Bool;                // én syklus lang, nullstiller sinceSend
+   seqNo     : UInt;
+
+   namesPending : Bool;             // klienten har navn til gode, sendes før data
+   namesBusy    : Bool;             // TSEND jobber med navnene, ikke txMsg
+
+END_VAR
+
+VAR_TEMP
+   i : Int;
+   // antall elementer, lest fra UDT-ene hver syklus
+   nTxBits  : Int;
+   nTxWords : Int;
+   nTxTimes : Int;
+   nTxInts  : Int;
+   nTxDints : Int;
+   nTxReals : Int;
+   nRxBits  : Int;
+   nRxWords : Int;
+   nRxInts  : Int;
+   nRxDints : Int;
+   nRxReals : Int;
+   nRxPulse : Int;
+   txBitBytes : Int;
+   rxBitBytes : Int;
+
+   badReason : Int;
+   digitalChanged  : Bool;
+   discreteChanged : Bool;
+   analogMoved     : Bool;
+   analogAllowed   : Bool;
+   hbDue         : Bool;
+   realChange    : Bool;
+   sendWanted    : Bool;
+   doSend  : Bool;
+   expectSeq : UInt;
+   delta   : DInt;
+   nowTime : DTL;
+   timeRet : Int;
+
+   // navnemelding, regnes ut bare i syklusen den sendes. Indeksrekkefølgen
+   // er layoutrekkefølgen: tx bits, words, times, ints, dints, reals, så det
+   // samme for rx, der [8] (rx times) alltid er 0.
+   namesReq : Bool;
+   nmCount  : Array[0..11] of Int;  // antall navn i hver seksjon
+   nmMax    : Array[0..11] of Int;  // deklarert strenglengde i hver seksjon
+   dataCount : Array[0..11] of Int; // plasser i den tilhørende dataarrayen
+   namesLen : DInt;
+
+END_VAR
+
+VAR CONSTANT
+   UP_MAGIC   : Byte := 16#A5;      // header PLS -> PC
+   UP_VER     : Byte := 7;
+   UP_HDR     : Int := 32;          // byte før txDigital
+
+   DOWN_MAGIC : Byte := 16#5A;      // header PC -> PLS
+   DOWN_VER   : Byte := 3;
+   DOWN_HDR   : Int := 14;          // byte før rxMsg.data
+
+   KIND_DATA  : Byte := 0;          // byte 7 i meldingen PLS -> PC
+   KIND_NAMES : Byte := 1;
+   TSEND_MAX  : DInt := 8192;       // S7-1200-grensen for én TSEND-jobb, i byte
+
+   GAP_MAX    : Time := T#1h;       // tak for timerne, begrenser bare avlesningene
+
+   ST_IDLE       : Int := 0;
+   ST_CONNECTING : Int := 1;
+   ST_UP         : Int := 2;
+   ST_DISCONNECTING : Int := 3;
+END_VAR
+
+
+// =====================================================================
+// 0. størrelser, lest fra UDT-ene
+// Bool-arrayer fyller hele 16-bits words i ikke-optimert minne, så
+// bit-seksjonene rundes opp til et partall byte. pulse begrenses til bits,
+// så en UDT som ikke stemmer, ikke kan indeksere forbi noen av arrayene.
+// =====================================================================
+#nTxBits  := "TcpLinkCount"(arr := #txDigital.bits);
+#nTxWords := "TcpLinkCount"(arr := #txDigital.words);
+#nTxTimes := "TcpLinkCount"(arr := #txDigital.times);
+#nTxInts  := "TcpLinkCount"(arr := #txAnalog.ints);
+#nTxDints := "TcpLinkCount"(arr := #txAnalog.dints);
+#nTxReals := "TcpLinkCount"(arr := #txAnalog.reals);
+#nRxBits  := "TcpLinkCount"(arr := #rx.bits);
+#nRxWords := "TcpLinkCount"(arr := #rx.words);
+#nRxInts  := "TcpLinkCount"(arr := #rx.ints);
+#nRxDints := "TcpLinkCount"(arr := #rx.dints);
+#nRxReals := "TcpLinkCount"(arr := #rx.reals);
+#nRxPulse := "TcpLinkCount"(arr := #rx.pulse);
+IF #nRxPulse > #nRxBits THEN
+    #nRxPulse := #nRxBits;
+END_IF;
+
+#txBitBytes := ((#nTxBits + 15) / 16) * 2;
+#rxBitBytes := ((#nRxBits + 15) / 16) * 2;
+#txLen := INT_TO_UINT(#UP_HDR + #txBitBytes + 2 * #nTxWords + 12 * #nTxTimes
+                      + 2 * #nTxInts + 4 * #nTxDints + 4 * #nTxReals);
+#rxLen := INT_TO_UINT(#DOWN_HDR + #rxBitBytes + 2 * #nRxWords
+                      + 2 * #nRxInts + 4 * #nRxDints + 4 * #nRxReals);
+
+// =====================================================================
+// 1. forbindelsesparametre
+// connId her og på kallene til TCON/TSEND/TRCV/TDISCON må være like, og må
+// være unik blant alle open-user-communication-blokker i CPU-en.
+// =====================================================================
+#connParam.InterfaceId := #hwInterface;
+#connParam.ID := #connId;
+#connParam.ConnectionType := 11;       // 11 = TCP
+#connParam.ActiveEstablished := FALSE; // passiv: klienten kobler seg til oss
+#connParam.LocalPort := #localPort;
+#connParam.RemotePort := 0;
+
+// =====================================================================
+// 2. kall forbindelsesinstruksjonene
+// Kalles ubetinget hver syklus, så DONE, BUSY og ERROR holdes levende.
+// REQ kommer fra statiske variabler som tilstandsmaskinen under eier.
+// =====================================================================
+#conInst(REQ := #reqCon,
+         ID := #connId,
+         CONNECT := #connParam);
+#tconStatus := #conInst.STATUS;
+
+#disconInst(REQ := #reqDis, ID := #connId);
+
+// =====================================================================
+// 3. mottak
+// LEN ligger fast, så TRCV holder igjen NDR til en hel ramme har kommet.
+// LEN er kortere enn rxMsg med vilje: den stopper før data.pulse.
+// EN_R bare mens linken er oppe.
+// =====================================================================
+#recvInst(EN_R := #linkUp,
+          ID := #connId,
+          LEN := #rxLen,
+          DATA := #rxMsg);
+#recvStatus := #recvInst.STATUS;
+
+#sinceRx(IN := #linkUp AND NOT #rxJustNow, PT := #GAP_MAX);
+#rxJustNow := FALSE;
+
+// Pulsene er FALSE som standard og settes bare i syklusen en stigende
+// flanke kommer, og det er det som gjør dem nøyaktig én syklus lange.
+FOR #i := 0 TO #nRxPulse - 1 DO
+    #rx.pulse[#i] := FALSE;
+END_FOR;
+#rxFresh := FALSE;
+#badFrame := FALSE;
+
+IF #recvInst.NDR THEN
+    // Sjekkes i rekkefølge, så rxBadReason navngir det første som er feil:
+    //   1  ikke en ramme i det hele tatt, eller en annen protokollversjon
+    //   2  en ramme, men med en annen lengde -- klienten sender et annet
+    //      antall byte, og strømmen er ute av takt
+    //   3  riktig lengde, annen layout -- samme antall byte, annen
+    //      blanding av typer. Uten denne sjekken ble den dekodet som søppel.
+    IF (#rxMsg.magic <> #DOWN_MAGIC) OR (#rxMsg.ver <> #DOWN_VER) THEN
+        #badReason := 1;
+    ELSIF #rxMsg.len <> #rxLen THEN
+        #badReason := 2;
+    ELSIF (#rxMsg.layout[0] <> INT_TO_BYTE(#rxBitBytes))
+          OR (#rxMsg.layout[1] <> INT_TO_BYTE(#nRxWords))
+          OR (#rxMsg.layout[2] <> 16#00)
+          OR (#rxMsg.layout[3] <> INT_TO_BYTE(#nRxInts))
+          OR (#rxMsg.layout[4] <> INT_TO_BYTE(#nRxDints))
+          OR (#rxMsg.layout[5] <> INT_TO_BYTE(#nRxReals)) THEN
+        #badReason := 3;
+    ELSE
+        #badReason := 0;
+    END_IF;
+
+    IF #badReason = 0 THEN
+        // ---- sekvenssjekk, bare for diagnose ----
+        IF #everRx THEN
+            #expectSeq := #prevRxSeq + 1;      // UInt går rundt ved 65535
+            IF #rxMsg.seq <> #expectSeq THEN
+                #rxGaps := #rxGaps + 1;
+            END_IF;
+        END_IF;
+        #prevRxSeq := #rxMsg.seq;
+        #everRx := TRUE;
+
+        // ---- stigende flanker, mot nivåene som skal erstattes ----
+        // Ingen utpakking: en Bool-array i ikke-optimert minne har allerede
+        // element i i byte i/8, bit i MOD 8 -- formatet på linjen.
+        FOR #i := 0 TO #nRxPulse - 1 DO
+            #rxMsg.data.pulse[#i] := #rxMsg.data.bits[#i] AND NOT #rx.bits[#i];
+        END_FOR;
+
+        // Nivåer, verdier og pulser på én gang.
+        #rx := #rxMsg.data;
+
+        #rxGap := #sinceRx.ET;         // leses før timeren nullstilles
+        #rxJustNow := TRUE;
+        #rxCount := #rxCount + 1;
+        #rxFresh := TRUE;
+    ELSE
+        // En TRCV med fast LEN kan ikke komme i takt igjen, så bryt linken og
+        // la tilstandsmaskinen bygge den opp på nytt i stedet for å dekode
+        // søppel for alltid.
+        #rxBadFrames := #rxBadFrames + 1;
+        #rxBadReason := #badReason;
+        #badFrame := TRUE;
+    END_IF;
+END_IF;
+
+// ---- timeout på mottak ---------------------------------------------
+// sinceRx ble lest over, FØR rammen i denne syklusen. Uten rxFresh-leddet
+// ville den første rammen etter en stille periode blitt nullstilt i samme
+// syklus som den kom, og neste ramme ville satt hver puls en gang til.
+#rxStale := NOT #linkUp OR (NOT #rxFresh AND (#sinceRx.ET >= #rxTimeout));
+
+IF #rxStale AND #clearOnTimeout THEN
+    // Sikkerhet: et foreldet settpunkt er verre enn ingen.
+    #rx := #rxZero;
+END_IF;
+
+// =====================================================================
+// 4. timer for nye forsøk
+// Nullstilles ved hvert forsøk, så ET er "tid siden siste forsøk", og
+// forsøkene sprer seg av seg selv.
+// =====================================================================
+#sinceTry(IN := NOT #tryJustNow, PT := #GAP_MAX);
+#tryJustNow := FALSE;
+
+// =====================================================================
+// 5. tilstandsmaskin for forbindelsen
+// =====================================================================
+CASE #state OF
+    0:  // ---- IDLE: ingenting åpent, venter ut tiden før neste forsøk ---
+        #linkUp := FALSE;
+        #reqCon := FALSE;
+        #reqDis := FALSE;
+        IF #enable AND (NOT #everTried OR (#sinceTry.ET >= #reconnectDelay)) THEN
+            #reqCon := TRUE;           // TCON plukker opp denne neste syklus
+            #tryJustNow := TRUE;       // start forsøksklokka på nytt
+            #everTried := TRUE;
+            #connAttempts := #connAttempts + 1;
+            #state := #ST_CONNECTING;
+        END_IF;
+
+    1:  // ---- CONNECTING: lytter, venter på klienten -----------------
+        IF NOT #enable THEN
+            #reqCon := FALSE;
+            #state := #ST_DISCONNECTING;
+        ELSIF #conInst.DONE THEN
+            #reqCon := FALSE;
+            #linkUp := TRUE;
+            #namesPending := TRUE;     // først navnene ...
+            #firstSend := TRUE;        // ... og så et fullt øyeblikksbilde
+            #everRx := FALSE;          // ny klient, sekvensen starter på nytt
+            #state := #ST_UP;
+        ELSIF #conInst.ERROR THEN
+            // Rydd opp før neste forsøk i stedet for å la den stå halvåpen.
+            #reqCon := FALSE;
+            #state := #ST_DISCONNECTING;
+        END_IF;
+
+    2:  // ---- CONNECTED --------------------------------------------
+        // At klienten forsvinner, viser seg som en feil på TSEND, og
+        // heartbeat garanterer at vi treffer den innen én heartbeat-periode.
+        // En dårlig ramme får samme behandling, fordi en TRCV med fast LEN
+        // ikke har noen annen vei tilbake i takt.
+        IF #sendInst.ERROR OR #recvInst.ERROR OR #conInst.ERROR
+           OR #badFrame OR NOT #enable THEN
+            #linkUp := FALSE;
+            #state := #ST_DISCONNECTING;
+        END_IF;
+
+    3:  // ---- DISCONNECTING: frigi ressursen, prøv så på nytt --------
+        #linkUp := FALSE;
+        #reqCon := FALSE;
+        #reqDis := TRUE;
+        IF #disconInst.DONE OR #disconInst.ERROR THEN
+            #reqDis := FALSE;
+            #state := #ST_IDLE;        // IDLE setter forsøkstimeren i gang igjen
+        END_IF;
+
+ELSE
+    #state := #ST_DISCONNECTING;       // kan ikke nås, men kom deg likevel
+END_CASE;
+
+#linkState := #state;
+#connected := #linkUp;
+
+// =====================================================================
+// 6. sendetimer
+// IN faller i nøyaktig én syklus etter at en melding er sendt, og det
+// nullstiller ET. PT er med vilje enorm: Q brukes aldri, ET er utgangen som
+// betyr noe, og en stor PT hindrer at ET flater ut ved taket.
+// =====================================================================
+#sinceSend(IN := #linkUp AND NOT #justSent, PT := #GAP_MAX);
+#justSent := FALSE;                    // brukt opp av kallet over
+
+#hbDue := #sinceSend.ET >= #heartbeat;
+#analogAllowed := #sinceSend.ET >= #analogMinInterval;
+
+IF #sinceSend.ET > #maxGap THEN
+    #maxGap := #sinceSend.ET;
+END_IF;
+
+// =====================================================================
+// 7. hva har endret seg
+// Alt sammenlignes med det som gikk ut i FORRIGE MELDING, ikke forrige
+// syklus, så en langsom drift forbi dødbåndet blir likevel fanget opp.
+// Legg merke til hva som IKKE er med her: tidsstempelet i headeren. Det
+// endrer seg hver syklus, så med det ville hver syklus sett ut som en
+// endring.
+// =====================================================================
+
+// Digitalt: hendelser, eksakt sammenligning.
+#digitalChanged := FALSE;
+FOR #i := 0 TO #nTxBits - 1 DO
+    IF #txDigital.bits[#i] XOR #prevDig.bits[#i] THEN
+        #digitalChanged := TRUE;
+    END_IF;
+END_FOR;
+FOR #i := 0 TO #nTxWords - 1 DO
+    IF #txDigital.words[#i] <> #prevDig.words[#i] THEN
+        #digitalChanged := TRUE;
+    END_IF;
+END_FOR;
+
+// Tider: ned til sekundet. NANOSECOND og WEEKDAY er utelatt, så en tid som
+// skrives på nytt hver syklus, sendes én gang i sekundet i stedet for hver
+// syklus, og en hendelsestid går likevel ut i det øyeblikket den settes.
+FOR #i := 0 TO #nTxTimes - 1 DO
+    IF (#txDigital.times[#i].YEAR <> #prevDig.times[#i].YEAR)
+       OR (#txDigital.times[#i].MONTH <> #prevDig.times[#i].MONTH)
+       OR (#txDigital.times[#i].DAY <> #prevDig.times[#i].DAY)
+       OR (#txDigital.times[#i].HOUR <> #prevDig.times[#i].HOUR)
+       OR (#txDigital.times[#i].MINUTE <> #prevDig.times[#i].MINUTE)
+       OR (#txDigital.times[#i].SECOND <> #prevDig.times[#i].SECOND) THEN
+        #digitalChanged := TRUE;
+    END_IF;
+END_FOR;
+
+// Analogt: dødbånd <= 0 gjør en verdi diskret, så den havner i
+// discreteChanged og går ut med en gang; alt annet må flytte seg med
+// dødbåndet sitt og deretter vente på tidsgrensen.
+#discreteChanged := FALSE;
+#analogMoved := FALSE;
+
+// Ints utvides til DInt først, så subtraksjonen ikke kan flyte over i
+// endene av Int-området.
+FOR #i := 0 TO #nTxInts - 1 DO
+    #delta := ABS(INT_TO_DINT(#txAnalog.ints[#i]) - INT_TO_DINT(#prevAna.ints[#i]));
+    IF #deadband.ints[#i] <= 0 THEN
+        IF #delta > 0 THEN
+            #discreteChanged := TRUE;
+        END_IF;
+    ELSIF #delta >= INT_TO_DINT(#deadband.ints[#i]) THEN
+        #analogMoved := TRUE;
+    END_IF;
+END_FOR;
+
+FOR #i := 0 TO #nTxDints - 1 DO
+    IF #deadband.dints[#i] <= 0 THEN
+        IF #txAnalog.dints[#i] <> #prevAna.dints[#i] THEN
+            #discreteChanged := TRUE;
+        END_IF;
+    ELSIF ABS(#txAnalog.dints[#i] - #prevAna.dints[#i]) >= #deadband.dints[#i] THEN
+        #analogMoved := TRUE;
+    END_IF;
+END_FOR;
+
+FOR #i := 0 TO #nTxReals - 1 DO
+    IF #deadband.reals[#i] <= 0.0 THEN
+        IF #txAnalog.reals[#i] <> #prevAna.reals[#i] THEN
+            #discreteChanged := TRUE;
+        END_IF;
+    ELSIF ABS(#txAnalog.reals[#i] - #prevAna.reals[#i]) >= #deadband.reals[#i] THEN
+        #analogMoved := TRUE;
+    END_IF;
+END_FOR;
+
+// =====================================================================
+// 8. bestem
+// realChange holdes adskilt fra hbDue, så tellerne kan skille de to
+// fra hverandre etterpå.
+// =====================================================================
+#realChange := #digitalChanged
+               OR #discreteChanged
+               OR (#analogMoved AND #analogAllowed)
+               OR #firstSend;
+
+#sendWanted := #realChange OR #hbDue;
+
+// ---- navnene går først -----------------------------------------------
+// Skyldes etter hver tilkobling og på en flanke på resendNames. Sjekkes før
+// dataene, så en ny klient har navnene før de første verdiene kommer.
+// Bare når TSEND er ledig: én jobb om gangen på én forbindelse.
+#resendEdge(CLK := #resendNames);
+IF #resendEdge.Q THEN
+    #namesPending := TRUE;
+END_IF;
+IF NOT #linkUp THEN
+    #namesPending := FALSE;            // en ny forbindelse skylder dem uansett
+END_IF;
+
+#namesReq := FALSE;
+IF #linkUp AND #namesPending AND NOT #namesBusy AND NOT #sendInst.BUSY THEN
+    #namesPending := FALSE;
+
+    // Navn per seksjon, lest fra UDT-en. En navnearray kan være kortere enn
+    // dataarrayen sin, så de telles hver for seg.
+    #nmCount[0] := "TcpLinkCount"(arr := #names.txBits);
+    #nmCount[1] := "TcpLinkCount"(arr := #names.txWords);
+    #nmCount[2] := "TcpLinkCount"(arr := #names.txTimes);
+    #nmCount[3] := "TcpLinkCount"(arr := #names.txInts);
+    #nmCount[4] := "TcpLinkCount"(arr := #names.txDints);
+    #nmCount[5] := "TcpLinkCount"(arr := #names.txReals);
+    #nmCount[6] := "TcpLinkCount"(arr := #names.rxBits);
+    #nmCount[7] := "TcpLinkCount"(arr := #names.rxWords);
+    #nmCount[8] := 0;                  // rx times: ingen slik seksjon
+    #nmCount[9] := "TcpLinkCount"(arr := #names.rxInts);
+    #nmCount[10] := "TcpLinkCount"(arr := #names.rxDints);
+    #nmCount[11] := "TcpLinkCount"(arr := #names.rxReals);
+
+    // Den deklarerte lengden på strengene i hver seksjon, String[20] ->
+    // 20. Hvis CPU-en din ikke har MAX_LEN, skriv inn tallet i stedet.
+    #nmMax[0] := DINT_TO_INT(MAX_LEN(#names.txBits[0]));
+    #nmMax[1] := DINT_TO_INT(MAX_LEN(#names.txWords[0]));
+    #nmMax[2] := DINT_TO_INT(MAX_LEN(#names.txTimes[0]));
+    #nmMax[3] := DINT_TO_INT(MAX_LEN(#names.txInts[0]));
+    #nmMax[4] := DINT_TO_INT(MAX_LEN(#names.txDints[0]));
+    #nmMax[5] := DINT_TO_INT(MAX_LEN(#names.txReals[0]));
+    #nmMax[6] := DINT_TO_INT(MAX_LEN(#names.rxBits[0]));
+    #nmMax[7] := DINT_TO_INT(MAX_LEN(#names.rxWords[0]));
+    #nmMax[8] := 0;
+    #nmMax[9] := DINT_TO_INT(MAX_LEN(#names.rxInts[0]));
+    #nmMax[10] := DINT_TO_INT(MAX_LEN(#names.rxDints[0]));
+    #nmMax[11] := DINT_TO_INT(MAX_LEN(#names.rxReals[0]));
+
+    #dataCount[0] := #nTxBits;
+    #dataCount[1] := #nTxWords;
+    #dataCount[2] := #nTxTimes;
+    #dataCount[3] := #nTxInts;
+    #dataCount[4] := #nTxDints;
+    #dataCount[5] := #nTxReals;
+    #dataCount[6] := #nRxBits;
+    #dataCount[7] := #nRxWords;
+    #dataCount[8] := 0;
+    #dataCount[9] := #nRxInts;
+    #dataCount[10] := #nRxDints;
+    #dataCount[11] := #nRxReals;
+
+    // Hver S7-streng er den deklarerte lengden pluss to byte: maks lengde
+    // og nåværende lengde. En odde deklarert lengde ville etterlatt en
+    // fyllbyte som klienten ikke kan regne med, så den avvises.
+    #namesStatus := 0;
+    #namesLen := INT_TO_DINT(#UP_HDR);
+    FOR #i := 0 TO 11 DO
+        #namesLen := #namesLen + INT_TO_DINT(#nmCount[#i]) * INT_TO_DINT(#nmMax[#i] + 2);
+        IF #nmCount[#i] > #dataCount[#i] THEN
+            #namesStatus := 1;         // sendes likevel; de ekstra har ingen plass
+        END_IF;
+    END_FOR;
+    FOR #i := 0 TO 11 DO
+        IF (#nmMax[#i] MOD 2) <> 0 THEN
+            #namesStatus := 3;
+        END_IF;
+    END_FOR;
+    IF (#namesStatus <> 3) AND (#namesLen > #TSEND_MAX) THEN
+        #namesStatus := 2;
+    END_IF;
+
+    // Headeren legges i hdr-medlemmet først i DB-en til den som kaller, så
+    // TSEND kan sende DB-en slik den står.
+    IF #namesStatus < 2 THEN
+        #seqNo := #seqNo + 1;
+        #names.hdr.magic := #UP_MAGIC;
+        #names.hdr.ver := #UP_VER;
+        #names.hdr.len := DINT_TO_UINT(#namesLen);
+        #names.hdr.seq := #seqNo;
+        #names.hdr.flags := 0;
+        #names.hdr.kind := #KIND_NAMES;
+        FOR #i := 0 TO 11 DO
+            #names.hdr.layout[#i] := INT_TO_BYTE(#nmCount[#i]);
+            #names.hdr.spare[#i] := 0;
+        END_FOR;
+        #namesReq := TRUE;
+        #namesBusy := TRUE;
+    END_IF;
+END_IF;
+
+// ---- data ---------------------------------------------------------------
+#doSend := #linkUp AND #sendWanted AND NOT #sendInst.BUSY AND NOT #namesBusy;
+
+// En sending ble ønsket og avvist. Hvis denne stiger mens meldinger ikke
+// kommer fram, gjør blokken jobben sin, og det er transporten som svikter.
+// Venting bak navnene telles ikke: det er blokkens egen trafikk.
+IF #linkUp AND #sendWanted AND #sendInst.BUSY AND NOT #namesBusy THEN
+    #blockedScans := #blockedScans + 1;
+END_IF;
+
+
+// =====================================================================
+// 9. bygg meldingen
+// Røres bare når en sending skal til å starte, så bufferen står stille for
+// TSEND mens BUSY er TRUE.
+// =====================================================================
+IF #doSend THEN
+    // Les klokka her, ikke hver syklus: det koster et systemkall, og
+    // ingenting tidligere i blokken trenger den.
+    IF #useExtTime THEN
+        #nowTime := #extTime;
+        #timeRet := 0;
+    ELSIF #useLocalTime THEN
+        // Hvis TIA-versjonen din avviser formen med navn, prøv RD_LOC_T(#nowTime)
+        #timeRet := RD_LOC_T(OUT => #nowTime);
+    ELSE
+        #timeRet := RD_SYS_T(OUT => #nowTime);
+    END_IF;
+    #timeStatus := #timeRet;
+
+    #seqNo := #seqNo + 1;
+    #txMsg.magic := #UP_MAGIC;
+    #txMsg.ver := #UP_VER;
+    #txMsg.len := #txLen;
+    #txMsg.seq := #seqNo;
+    #txMsg.flags := 0;
+    #txMsg.flags.%X0 := #useLocalTime;
+    #txMsg.kind := #KIND_DATA;
+
+    #txMsg.layout[0] := INT_TO_BYTE(#txBitBytes);
+    #txMsg.layout[1] := INT_TO_BYTE(#nTxWords);
+    #txMsg.layout[2] := INT_TO_BYTE(#nTxTimes);
+    #txMsg.layout[3] := INT_TO_BYTE(#nTxInts);
+    #txMsg.layout[4] := INT_TO_BYTE(#nTxDints);
+    #txMsg.layout[5] := INT_TO_BYTE(#nTxReals);
+    #txMsg.layout[6] := INT_TO_BYTE(#rxBitBytes);
+    #txMsg.layout[7] := INT_TO_BYTE(#nRxWords);
+    #txMsg.layout[8] := 16#00;         // ingen times i retning PC -> PLS foreløpig
+    #txMsg.layout[9] := INT_TO_BYTE(#nRxInts);
+    #txMsg.layout[10] := INT_TO_BYTE(#nRxDints);
+    #txMsg.layout[11] := INT_TO_BYTE(#nRxReals);
+
+    #txMsg.ts := #nowTime;
+
+    // Hele innholdet i to tilordninger: samme typer, samme byte-layout som
+    // på linjen, så det er ingenting å pakke.
+    #txMsg.dig := #txDigital;
+    #txMsg.ana := #txAnalog;
+END_IF;
+
+// Én TSEND, to buffere. Fra syklusen en navnejobb starter til syklusen den
+// slutter, kalles TSEND med den bufferen og ingenting annet.
+IF #namesBusy THEN
+    #sendInst(REQ := #namesReq,
+              ID := #connId,
+              LEN := #names.hdr.len,
+              DATA := #names);
+ELSE
+    #sendInst(REQ := #doSend,
+              ID := #connId,
+              LEN := #txLen,
+              DATA := #txMsg);
+END_IF;
+#sendStatus := #sendInst.STATUS;
+
+// Navnejobben er over så snart TSEND ikke er opptatt: DONE, eller ERROR --
+// som tilstandsmaskinen gjør om til en ny tilkobling, og en ny tilkobling
+// sender navnene igjen.
+IF #namesBusy AND NOT #sendInst.BUSY THEN
+    #namesBusy := FALSE;
+    IF #sendInst.DONE THEN
+        #namesSent := #namesSent + 1;
+    END_IF;
+END_IF;
+
+// =====================================================================
+// 10. bokføring etter en sending
+// Alle sammenligningsgrunnlag oppdateres, også analoge verdier som ennå
+// ikke hadde passert dødbåndet sitt -- meldingen bærer de nåværende tallene,
+// så sammenligningen må starte på nytt fra dem.
+// =====================================================================
+IF #doSend THEN
+    #prevDig := #txDigital;
+    #prevAna := #txAnalog;
+
+    #lastGap := #sinceSend.ET;         // leses før timeren nullstilles
+    #justSent := TRUE;                 // nullstiller timeren ved neste kall
+    #firstSend := FALSE;
+
+    #txCount := #txCount + 1;
+    IF #realChange THEN
+        #changeSends := #changeSends + 1;
+    ELSE
+        #hbSends := #hbSends + 1;      // keepalive i ro, ingenting hadde endret seg
+    END_IF;
+END_IF;
+
+// =====================================================================
+// 11. lås feil
+// STATUS faller tilbake til 7000 så snart instruksjonen er i ro, så en
+// levende avlesning går nesten alltid glipp av feilen som betydde noe.
+// =====================================================================
+#sendErrEdge(CLK := #sendInst.ERROR);
+IF #sendErrEdge.Q THEN
+    #sendErrors := #sendErrors + 1;
+    #lastSendError := #sendInst.STATUS;
+END_IF;
+
+#recvErrEdge(CLK := #recvInst.ERROR);
+IF #recvErrEdge.Q THEN
+    #recvErrors := #recvErrors + 1;
+    #lastRecvError := #recvInst.STATUS;
+END_IF;
+
+#tconErrEdge(CLK := #conInst.ERROR);
+IF #tconErrEdge.Q THEN
+    #tconErrors := #tconErrors + 1;
+    #lastTconError := #conInst.STATUS;
+END_IF;
+
+// =====================================================================
+// 12. valgfri nullstilling av tellere, styrt fra en overvåkingstabell
+// =====================================================================
+IF #resetStats THEN
+    #txCount := 0;
+    #hbSends := 0;
+    #changeSends := 0;
+    #blockedScans := 0;
+    #connAttempts := 0;
+    #rxCount := 0;
+    #rxBadFrames := 0;
+    #rxGaps := 0;
+    #sendErrors := 0;
+    #recvErrors := 0;
+    #tconErrors := 0;
+    #maxGap := T#0ms;
+    #lastGap := T#0ms;
+    #rxGap := T#0ms;
+    #lastSendError := 16#0000;
+    #lastRecvError := 16#0000;
+    #lastTconError := 16#0000;
+    #rxBadReason := 0;
+    #namesSent := 0;
+END_IF;
+
+END_FUNCTION_BLOCK
