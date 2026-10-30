@@ -128,6 +128,8 @@
     p.tags = p.tags || [];
     p.device = p.device || { name: 'PLC_1', type: 'CPU 1214C' };
     p.blocks = p.blocks || [];
+    p.types = Array.isArray(p.types) ? p.types : [];       // PLC data types (UDTs)
+    p.sources = Array.isArray(p.sources) ? p.sources : [];  // external source files
     p.gpio = Array.isArray(p.gpio) ? p.gpio : [];   // ESP32 I/O map (tag -> GPIO or shift-register channel)
     p.shiftRegs = Array.isArray(p.shiftRegs) ? p.shiftRegs : [];   // 74HC595 / 74HC165 chains
     if (!p.i2c || typeof p.i2c !== 'object') p.i2c = { sda: null, scl: null, khz: 100, devices: [] };   // I2C I/O modules
@@ -190,6 +192,12 @@
     } else if (tab.type === 'esp32') {
       if (T.editors.esp32 && T.editors.esp32.open) T.editors.esp32.open(host);
       else host.appendChild(T.el('div', { class: 'tia-empty' }, 'ESP32 view not available'));
+    } else if (tab.type === 'type') {
+      const ty = (T.project.types || []).find((x) => x.id === tab.refId);
+      if (ty && T.editors.udt) T.editors.udt.open(host, ty);
+    } else if (tab.type === 'source') {
+      const src = (T.project.sources || []).find((x) => x.id === tab.refId);
+      if (src && T.editors.source) T.editors.source.open(host, src);
     } else {
       const block = T.findBlock(tab.blockId);
       if (block) {
@@ -232,6 +240,16 @@
     }
     activateTab(key);
   }
+  // a PLC data type / an external source file in its own tab
+  function openRef(kind, obj) {
+    const key = kind + ':' + obj.id;
+    if (!openTabs.find((t) => t.key === key)) {
+      openTabs.push({ key, title: kind === 'type' ? '"' + obj.name + '"' : obj.name, type: kind, refId: obj.id });
+    }
+    activateTab(key);
+  }
+  // re-render the active tab (its model changed underneath, e.g. generated from source)
+  T.app.refreshTab = function () { if (activeTabKey) activateTab(activeTabKey); };
   function openEsp32() {
     const key = 'esp32';
     if (!openTabs.find((t) => t.key === key)) {
@@ -257,8 +275,18 @@
         const b = T.findBlock(t.blockId);
         if (b) t.title = b.name + ' [' + b.type + b.number + ']';
         else t.key = '__dead__';
+      } else if (t.type === 'type' || t.type === 'source') {
+        const o = ((t.type === 'type' ? T.project.types : T.project.sources) || []).find((x) => x.id === t.refId);
+        if (o) t.title = t.type === 'type' ? '"' + o.name + '"' : o.name;
+        else t.key = '__dead__';
       }
     });
+    if (activeTabKey && !openTabs.some((t) => t.key === activeTabKey && t.key !== '__dead__')) {
+      for (let i = openTabs.length - 1; i >= 0; i--) if (openTabs[i].key === '__dead__') openTabs.splice(i, 1);
+      const next = openTabs[openTabs.length - 1];
+      if (next) activateTab(next.key);
+      else { activeTabKey = null; T.clear(byId('tia-editor')); }
+    }
     for (let i = openTabs.length - 1; i >= 0; i--) if (openTabs[i].key === '__dead__') openTabs.splice(i, 1);
     renderTabs();
   });
@@ -540,6 +568,15 @@
     };
     const PARAM_SKIP = { op: 1, target: 1, instanceDb: 1 };
 
+    // data types and block layouts: unknown types, bad arrays, a type that
+    // contains itself, more than 64 KB ...
+    (T.project.types || []).forEach((ty) => {
+      try { T.types.parse('"' + ty.name + '"'); } catch (e) { err('PLC data type "' + ty.name + '": ' + e.message); }
+    });
+    (T.project.blocks || []).forEach((b) => {
+      try { T.types.blockType(b); } catch (e) { err(b.name + ' [' + b.type + b.number + '] ' + (b.type === 'DB' ? 'data' : 'interface') + ': ' + e.message); }
+    });
+
     (T.project.blocks || []).forEach((b) => {
       if (b.type === 'DB') return;
       const locals = new Set(T.ifaceMembers(b).map((e) => String(e.member.name || '').toLowerCase()));
@@ -610,6 +647,8 @@
   /* ------------------------------------------------------ bus wiring */
   T.bus.on('open:block', (block) => block && openBlock(block));
   T.bus.on('open:tags', () => openTags());
+  T.bus.on('open:type', (ty) => ty && openRef('type', ty));
+  T.bus.on('open:source', (src) => src && openRef('source', src));
   T.bus.on('open:esp32', () => openEsp32());
   T.bus.on('block:activated', () => { if (inspectorTab === 'props') renderInspector(); });
   T.bus.on('tags:changed', () => { if (inspectorTab === 'sim') renderInspector(); });
@@ -653,7 +692,7 @@
   function initAutosave() {
     let dirty = false, failed = false;
     // iface:changed covers block-interface edits AND the SCL editor's typing signal
-    ['tags:changed', 'tree:changed', 'block:activated', 'iface:changed']
+    ['tags:changed', 'tree:changed', 'block:activated', 'iface:changed', 'types:changed', 'sources:changed', 'db:changed']
       .forEach((ev) => T.bus.on(ev, () => { dirty = true; }));
     const flush = () => {
       if (!dirty || !T.project) return;

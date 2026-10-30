@@ -1,6 +1,7 @@
 /* web_server.c — see web_server.h */
 #include "web_server.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -228,9 +229,29 @@ static esp_err_t api_info(httpd_req_t *req)
     return r;
 }
 
+/* in-place %XX / '+' decoding of a query value */
+static void url_decode(char *s)
+{
+    char *d = s;
+    for (; *s; s++) {
+        if (*s == '%' && isxdigit((unsigned char)s[1]) && isxdigit((unsigned char)s[2])) {
+            char h[3] = {s[1], s[2], 0};
+            *d++ = (char)strtol(h, NULL, 16);
+            s += 2;
+        } else *d++ = *s == '+' ? ' ' : *s;
+    }
+    *d = 0;
+}
+
+/* GET /api/state[?dbs=Name1,Name2]: the snapshot, plus the bytes of the named
+ * data blocks (hex) for the IDE's DB view, which decodes them itself */
 static esp_err_t api_state(httpd_req_t *req)
 {
     jw_t *w = &s_state_w;
+    char q[CONFIG_HTTPD_MAX_URI_LEN], dbs[CONFIG_HTTPD_MAX_URI_LEN];
+    dbs[0] = 0;
+    if (httpd_req_get_url_query_str(req, q, sizeof q) == ESP_OK && httpd_query_key_value(q, "dbs", dbs, sizeof dbs) == ESP_OK)
+        url_decode(dbs);
     jw_reset(w);
     jw_obj(w);
     plc_rt_status_t st;
@@ -239,6 +260,10 @@ static esp_err_t api_state(httpd_req_t *req)
     plc_rt_status_locked(&st);
     jw_kbool(w, "running", st.running);
     plc_snapshot_json(e, w);
+    if (dbs[0]) {
+        jw_key(w, "dbs");
+        plc_dbs_json(e, w, dbs);
+    }
     uint32_t scan_ms = plc_scan_ms(e);
     plc_rt_unlock();
     jw_kint(w, "programRev", st.rev);

@@ -238,6 +238,15 @@ EXPORT void emu_comm_reset(void *p)
 }
 
 /* the program's connections (engine view) */
+/* data block contents as hex: {"<DB>": "..."} for the comma-separated names */
+EXPORT char *emu_dbs(void *p, const char *only)
+{
+    jw_t w;
+    jw_init(&w, NULL);
+    plc_dbs_json((plc_t *)p, &w, only);
+    return finish(&w);
+}
+
 EXPORT char *emu_conns(void *p)
 {
     jw_t w;

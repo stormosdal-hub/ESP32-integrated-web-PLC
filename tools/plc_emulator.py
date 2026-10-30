@@ -32,7 +32,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 WEB = os.path.join(ROOT, 'web')
@@ -84,6 +84,8 @@ class Engine:
             getattr(L, f).argtypes = [vp]
         L.emu_sockets.restype = vp
         L.emu_sockets.argtypes = []
+        L.emu_dbs.restype = vp
+        L.emu_dbs.argtypes = [vp, cp]
         L.emu_modbus_map.restype = vp
         L.emu_modbus_map.argtypes = [vp, ctypes.c_int]
         L.emu_free_str.argtypes = [vp]
@@ -589,6 +591,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/state':
                 snap = e.json('emu_snapshot', h) or {}
                 snap.update({'running': rt.running, 'programRev': rt.rev, 'cycle': dict(rt.stats, scanMs=e.L.emu_scan_ms(h))})
+                dbs = (parse_qs(urlparse(self.path).query).get('dbs') or [''])[0]
+                if dbs:  # the named data blocks' bytes (hex) for the IDE's DB view
+                    snap['dbs'] = e.json('emu_dbs', h, dbs.encode('utf-8')) or {}
                 return self._send(200, snap)
             if path == '/api/tags':
                 return self._send(200, {'ok': True, 'programRev': rt.rev, 'tags': e.json('emu_tags', h) or []})

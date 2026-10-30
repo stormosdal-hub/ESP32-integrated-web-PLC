@@ -454,7 +454,7 @@
     (list || []).forEach((m) => {
       if (!m || !String(m.name || '').trim()) return;
       const cm = m.comment ? '   // ' + String(m.comment).replace(/\n/g, ' ') : '';
-      if (/struct$/i.test(String(m.dataType || '').trim())) {
+      if (/(^|\s)struct$/i.test(String(m.dataType || '').trim())) {
         out.push(ind + m.name + ' : ' + m.dataType + cm);
         out.push(...memberLines(m.members, ind + '   '));
         out.push(ind + 'END_STRUCT;');
