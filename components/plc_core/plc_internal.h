@@ -7,9 +7,14 @@
  *   CK_BIT/BYTE/WORD/DINT/REAL — S7-style overlapping bytes of the I/Q/M
  *       process images (big-endian; W signed 16, B unsigned 8, D signed 32 or
  *       IEEE float32 when a Real tag sits on that D address)
- *   CK_SYM — a named flat cell: symbolic tag, block-interface member
- *       ("<instance>.<member>"), or undeclared symbol
+ *   CK_SYM — a named flat cell: symbolic tag or undeclared symbol
+ *   CK_LOC — an elementary value inside a typed buffer: a block-interface
+ *       member ("<instance>.<member>") or an element of a data block
  *   CK_LIT — a literal; CK_NONE — empty operand (reads FALSE, ignores writes)
+ *
+ * Typed data (plc_types.c, the port of web/js/types.js): every block
+ * instance, FC frame and DB is a byte buffer laid out like an S7 data block
+ * with standard (non-optimized) access.
  * ==========================================================================*/
 #pragma once
 
@@ -36,7 +41,7 @@ static inline double numv(pv_t v) { return isfinite(v.n) ? v.n : 0.0; }
 static inline bool truthy(pv_t v) { return v.n != 0.0 && !isnan(v.n); }
 
 /* ------------------------------------------------------------- cells */
-enum { CK_NONE = 0, CK_LIT, CK_BIT, CK_BYTE, CK_WORD, CK_DINT, CK_REAL, CK_SYM };
+enum { CK_NONE = 0, CK_LIT, CK_BIT, CK_BYTE, CK_WORD, CK_DINT, CK_REAL, CK_SYM, CK_LOC };
 enum { AREA_I = 0, AREA_Q = 1, AREA_M = 2 };
 
 typedef struct {
@@ -52,6 +57,72 @@ typedef struct {
     cref_t c;
     bool bit;       /* storage class is a bit (SCL typing, sim.js opIsBit) */
 } ref_t;
+
+/* ------------------------------------------------------------ data types */
+enum { TK_EL = 0, TK_STR, TK_ARR, TK_STRUCT, TK_FB, TK_VARIANT, TK_STRV, TK_VOID };
+/* elementary classes; TC_NUM = the untyped number of the old SCL */
+enum { TC_BOOL = 0, TC_INT, TC_BITS, TC_REAL, TC_TIME, TC_DATE, TC_TOD, TC_CHAR, TC_NUM };
+enum { SEC_NONE = 0, SEC_IN, SEC_OUT, SEC_INOUT, SEC_STAT, SEC_TEMP, SEC_CONST, SEC_RET };
+#define TY_MAX_DIMS 6
+
+typedef struct ty ty_t;
+struct sysdef;
+struct blk;
+
+typedef struct {
+    const char *name;
+    const ty_t *t;       /* storage type (TK_VARIANT for a reference parameter) */
+    const ty_t *reft;    /* reference parameter: the declared type */
+    const char *def;     /* declared default text ("" none) */
+    uint32_t off;
+    uint8_t bit, sec, ref;
+} fld_t;
+
+struct ty {
+    uint8_t k, cls, bits, sign, any, ndim;
+    uint16_t len;              /* String[len] */
+    uint32_t size;             /* bytes (Bool: 0) */
+    uint32_t count, stride;    /* arrays */
+    int32_t lo[TY_MAX_DIMS], hi[TY_MAX_DIMS];
+    const ty_t *el;            /* array element */
+    const char *name;          /* elementary / UDT / FB name ("" anonymous struct) */
+    fld_t *f;                  /* struct / FB fields */
+    uint16_t nf;
+    const struct sysdef *sys;  /* system FB */
+    struct blk *blk;           /* user FB */
+    const char *sig;           /* layout signature, built on demand */
+};
+
+/* the elementary types and expression pseudo types */
+extern const ty_t TY_BOOL, TY_BYTE, TY_WORD, TY_DWORD, TY_SINT, TY_USINT, TY_INT, TY_UINT, TY_DINT, TY_UDINT,
+    TY_REAL, TY_LREAL, TY_TIME, TY_DATE, TY_TOD, TY_CHAR, TY_ANYINT, TY_ANYREAL, TY_NUM, TY_VARIANT, TY_STRV,
+    TY_VOID;
+
+/* a reference parameter, bound per call (Variant, complex in-out ...) */
+typedef struct {
+    uint8_t *ptr;              /* NULL: unbound */
+    const ty_t *t;
+    cref_t cell;               /* is_cell: a classic operand (tag) */
+    uint8_t bit, is_cell, cbit;
+} vref_t;
+
+/* memory of one block instance / FC frame / data block */
+typedef struct mem {
+    const char *name;          /* instance key: DB name, "<inst>.<member>", "<inst>/<call>" ... */
+    uint8_t *buf;
+    const ty_t *t;
+    vref_t *refs;              /* one per field of t (reference fields only used) */
+    struct mem *next;
+} mem_t;
+
+/* an elementary value in a buffer (CK_LOC cells) */
+typedef struct {
+    uint8_t *ptr;
+    const ty_t *t;
+    const char *name;          /* snapshot key, NULL = not reported */
+    uint8_t bit;
+} loc_t;
+
 
 enum { SYM_ANY = 0, SYM_BOOL, SYM_NUM };
 typedef struct {
@@ -197,21 +268,28 @@ typedef struct {
 enum { BT_OB = 0, BT_FC, BT_FB, BT_DB, BT_OTHER };
 enum { BL_LAD = 0, BL_FBD, BL_SCL, BL_NONE };
 
-typedef struct {
+typedef struct blk {
     const char *id, *name;
     uint8_t type, lang;
     uint8_t active;     /* recursion guard while executing */
     uint8_t called;     /* referenced by a call (not an orphan) */
+    uint8_t ty_state;   /* 0 not built, 1 building (cycle guard), 2 built, 3 error */
     double number;
     int json;           /* jd node of the block object */
+    const ty_t *ty;     /* instance type (code blocks) / content type (DBs) */
+    const char *ty_err;
+    mem_t *dbm;         /* DB: its memory */
+    uint8_t warned;     /* SCL compile error reported */
 } blk_t;
 
 /* compile context of one unit: the block's interface members for this instance */
 typedef struct {
     smap_t map;         /* lowercase member name -> index */
-    cref_t *cell;
+    cref_t *cell;       /* CK_LOC (elementary) / CK_NONE (structured, reference) */
     uint8_t *is_bool;
     int n;
+    const ty_t *t;      /* instance type of the block (NULL: interface type error) */
+    mem_t *m;           /* instance memory */
 } members_t;
 
 struct scl_stmt;
@@ -219,6 +297,9 @@ struct scl_stmt;
 typedef struct unit {
     blk_t *blk;
     const char *inst;
+    struct unit *parent;    /* the unit whose code created this one (recursion check) */
+    bool norun;             /* recursive call / interface error: the body never runs */
+    bool bad;               /* interface type error: calls of it do nothing */
     members_t mem;
     uint16_t nnet;
     net_t *nets;
@@ -284,6 +365,19 @@ struct plc {
     cref_t *iocell;
     size_t nio;
 
+    loc_t *locs;            /* CK_LOC cells */
+    size_t nlocs, clocs;
+    mem_t *mems;            /* instance / DB memories */
+    smap_t mem_map;         /* name -> index in a temporary list (compile time) */
+    int *udt_json;          /* project.types: jd node of each PLC data type (compile time) */
+    const char **udt_name;
+    const ty_t **udt_ty;    /* built types (cache) */
+    uint8_t *udt_state;     /* 0 not built, 1 building (cycle check), 2 built */
+    size_t nudt;
+    const ty_t *bty[40];    /* system FB / built-in struct types (plc_types.c) */
+
+    struct conn *conns[PLC_MAX_CONNS]; /* OUC connections (plc_sysfb.c) */
+
     const char **warn;
     size_t nwarn, cwarn;
 
@@ -303,16 +397,67 @@ char *plc_ar_strdup(plc_t *p, const char *s, size_t n);
 void plc_warnf(plc_t *p, const char *fmt, ...);
 void plc_errorf(plc_t *p, const char *fmt, ...);
 
+double plc_js_parse_float(const char *s);
+bool plc_ieq(const char *a, const char *b);
+cref_t plc_loc_cell(plc_t *p, uint8_t *ptr, uint8_t bit, const ty_t *t, const char *name);
+mem_t *plc_db_mem(plc_t *p, blk_t *db);
+blk_t *plc_find_block_name(plc_t *p, const char *name); /* case-insensitive */
+blk_t *plc_find_block_id(plc_t *p, const char *id);
+const ty_t *plc_block_type(plc_t *p, blk_t *b);         /* NULL on error (b->ty_err) */
+struct unit *plc_unit_for(plc_t *p, blk_t *b, const char *inst, uint8_t *view, struct unit *parent);
+int plc_tag_index(plc_t *p, const char *name);          /* -1 none */
 pv_t plc_rd(plc_t *p, cref_t c);
 void plc_wr(plc_t *p, cref_t c, pv_t v);
 /* resolve an operand string; mem = interface members in scope (NULL = global) */
 ref_t plc_resolve(plc_t *p, const members_t *mem, const char *raw);
 double plc_parse_time_ms(const char *s);
 
+/* ------------------------------------------------- types (plc_types.c) */
+const ty_t *ty_parse(plc_t *p, const char *s, int members_json, char *err, size_t errlen);
+const ty_t *ty_struct_of(plc_t *p, int members_json, const char *name, char *err, size_t errlen);
+const ty_t *ty_block_fields(plc_t *p, blk_t *b, char *err, size_t errlen);
+const ty_t *ty_sys(plc_t *p, const char *name);          /* system FB / struct by name, NULL none */
+const ty_t *ty_builtin_struct(plc_t *p, const char *name);
+const fld_t *ty_field(const ty_t *t, const char *name);  /* case-insensitive */
+const char *ty_sig(plc_t *p, const ty_t *t);
+bool ty_same(plc_t *p, const ty_t *a, const ty_t *b);
+const char *ty_name(const ty_t *t, char *buf, size_t cap);
+double ty_read(const uint8_t *b, uint8_t bit, const ty_t *t);
+void ty_write(uint8_t *b, uint8_t bit, const ty_t *t, double v);  /* v converted (ty_conv) */
+double ty_conv(double v, const ty_t *t);
+double ty_wrap(double x, int bits, bool sign);
+double ty_rhe(double x);
+double ty_round7(float f);
+size_t ty_str_read(const uint8_t *b, const ty_t *t, char *out, size_t cap);
+void ty_str_write(uint8_t *b, const ty_t *t, const char *s, size_t n);
+/* literal: 1 = number in *v, 2 = string in str (unescaped, NUL-terminated), 0 = not a literal */
+int ty_literal(const char *text, double *v, char *str, size_t strcap);
+bool ty_time_lit(const char *body, double *ms);
+size_t ty_unescape(const char *s, size_t n, char *out, size_t cap);
+void ty_init(plc_t *p, uint8_t *b, uint8_t bit, const ty_t *t, const char *def);
+void ty_start_values(plc_t *p, uint8_t *buf, const ty_t *t, int obj);
+/* constant path "a.b[3]" inside t: returns the type and fills off / bit, NULL when invalid */
+const ty_t *ty_locate(const ty_t *t, const char *path, uint32_t *off, uint8_t *bit);
+void ty_write_dtl(uint8_t *b, double ms);
+
+/* ------------------------------------------- system FBs (plc_sysfb.c) */
+typedef struct sysdef {
+    const char *name;
+    uint8_t kind;
+    const ty_t *cv;            /* counters: CV / PV type */
+} sysdef_t;
+enum { SK_TON = 1, SK_TOF, SK_TP, SK_IEC_TIMER, SK_R_TRIG, SK_F_TRIG, SK_CTU, SK_CTD, SK_CTUD,
+       SK_TCON, SK_TDISCON, SK_TSEND, SK_TRCV };
+const ty_t *plc_sysfb_type(plc_t *p, const char *name);  /* NULL: no such system FB */
+void plc_sysfb_exec(plc_t *p, const ty_t *t, uint8_t *inst, vref_t *refs);
+void plc_conns_close(plc_t *p);
+
 /* ------------------------------------------------------ SCL (plc_scl.c) */
 /* Parse + resolve SCL source. p == NULL: syntax check only (no cells created).
  * Returns false on a syntax error (message "line N: ..." in err). An empty
  * program compiles to *out == NULL. */
-bool plc_scl_compile(plc_t *p, const members_t *mem, const char *src, struct scl_stmt **out,
-                     char *err, size_t errlen, const char *blkname);
-void plc_scl_run(plc_t *p, struct scl_stmt *prog, const char *blkname);
+bool plc_scl_compile(plc_t *p, struct unit *u, const char *src, struct scl_stmt **out,
+                     char *err, size_t errlen);
+void plc_scl_run(plc_t *p, struct unit *u);
+/* names a block's code calls ("FC"(..), "InstanceDB"(..), FC(..)) — syntax only */
+void plc_scl_called(const char *src, void (*cb)(void *ctx, const char *name), void *ctx);

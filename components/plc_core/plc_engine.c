@@ -325,6 +325,8 @@ static double js_parse_float(const char *s)
 }
 
 static double js_round(double x) { return floor(x + 0.5); }
+double plc_js_parse_float(const char *s) { return js_parse_float(s); }
+bool plc_ieq(const char *a, const char *b) { return ieq(a, b); }
 
 /* T.parseTime: IEC time literal / plain ms -> milliseconds */
 double plc_parse_time_ms(const char *in)
@@ -524,6 +526,19 @@ static void touch(plc_t *p, cref_t c)
     if (c.idx < p->nregs) p->regs[c.idx].touched = 1;
 }
 
+/* an elementary value in a typed buffer; name = snapshot key (NULL: none) */
+cref_t plc_loc_cell(plc_t *p, uint8_t *ptr, uint8_t bit, const ty_t *t, const char *name)
+{
+    if (p->nlocs >= 0xFFFF) return mkref(CK_NONE, 0, 0, 0, 0);
+    p->locs = (loc_t *)vec_reserve(p, p->locs, &p->clocs, p->nlocs + 1, sizeof(loc_t));
+    loc_t *l = &p->locs[p->nlocs];
+    l->ptr = ptr;
+    l->bit = bit;
+    l->t = t;
+    l->name = name;
+    return mkref(CK_LOC, 0, 0, 0, (uint16_t)p->nlocs++);
+}
+
 static double round7(float f)
 {
     if (f == 0) return 0;
@@ -538,6 +553,11 @@ pv_t plc_rd(plc_t *p, cref_t c)
     switch (c.k) {
     case CK_LIT: return p->lits[c.idx];
     case CK_SYM: return p->syms[c.idx].v;
+    case CK_LOC: {
+        const loc_t *l = &p->locs[c.idx];
+        double v = ty_read(l->ptr, l->bit, l->t);
+        return l->t->cls == TC_BOOL ? pvb(v != 0) : pvn(v);
+    }
     case CK_BIT: return pvb((area_ptr(p, c.area)[c.off] >> c.bit) & 1);
     case CK_BYTE: return pvn(area_ptr(p, c.area)[c.off]);
     case CK_WORD: {
@@ -569,6 +589,11 @@ static uint32_t js_u32(double x)
 void plc_wr(plc_t *p, cref_t c, pv_t v)
 {
     switch (c.k) {
+    case CK_LOC: {
+        const loc_t *l = &p->locs[c.idx];
+        ty_write(l->ptr, l->bit, l->t, ty_conv(l->t->cls == TC_BOOL ? (truthy(v) ? 1 : 0) : numv(v), l->t));
+        return;
+    }
     case CK_SYM: {
         sym_t *s = &p->syms[c.idx];
         if (s->type == SYM_BOOL) s->v = pvb(truthy(v));
@@ -624,6 +649,86 @@ static inline void wrn(plc_t *p, cref_t c, double x) { plc_wr(p, c, pvn(x)); }
 /* ======================================================================== *
  *  Operand resolution (T.resolve)                                            *
  * ======================================================================== */
+blk_t *plc_find_block_name(plc_t *p, const char *name)
+{
+    for (size_t i = 0; i < p->nblocks; i++)
+        if (ieq(p->blocks[i].name, name)) return &p->blocks[i];
+    return NULL;
+}
+
+/* "#rec.flag", "Data".values[3], MyDb.a.b: types.js T.resolvePath. Returns 1
+ * with an elementary cell in r, 2 for a structured value (no cell), 0 when
+ * the path names nothing (the caller carries on with tags / symbols). */
+static int resolve_path(plc_t *p, const members_t *mem, const char *raw, ref_t *r)
+{
+    const char *s = raw;
+    bool local = false;
+    if (*s == '#') local = true, s++;
+    while (isws(*s)) s++;
+    char first[160];
+    const char *rest;
+    if (*s == '"') {
+        const char *e = strchr(s + 1, '"');
+        if (!e || e == s + 1) return 0;
+        size_t n = (size_t)(e - s - 1) < sizeof first - 1 ? (size_t)(e - s - 1) : sizeof first - 1;
+        memcpy(first, s + 1, n);
+        first[n] = 0;
+        rest = e + 1;
+    } else {
+        if (!(isalpha((unsigned char)*s) || *s == '_')) return 0;
+        const char *e = s;
+        while (isalnum((unsigned char)*e) || *e == '_') e++;
+        size_t n = (size_t)(e - s) < sizeof first - 1 ? (size_t)(e - s) : sizeof first - 1;
+        memcpy(first, s, n);
+        first[n] = 0;
+        rest = e;
+    }
+    uint32_t off;
+    uint8_t bit;
+    const ty_t *lt;
+    if (mem && mem->t && mem->m) {
+        const fld_t *f = ty_field(mem->t, first);
+        if (f && !f->ref) {
+            lt = ty_locate(mem->t, s, &off, &bit);
+            if (!lt) return 0;
+            if (lt->k != TK_EL) return 2;
+            r->c = plc_loc_cell(p, mem->m->buf + off, bit, lt, NULL);
+            r->bit = lt->cls == TC_BOOL;
+            return 1;
+        }
+        if (f) return 0; /* reference parameters: SCL only */
+    }
+    const char *q = rest;
+    while (isws(*q)) q++;
+    if (local || !*q) return 0;
+    blk_t *db = NULL;
+    for (size_t i = 0; i < p->nblocks; i++)
+        if (p->blocks[i].type == BT_DB && ieq(p->blocks[i].name, first)) {
+            db = &p->blocks[i];
+            break;
+        }
+    if (!db) return 0;
+    mem_t *m = plc_db_mem(p, db);
+    if (!m) return 0;
+    lt = ty_locate(m->t, rest, &off, &bit);
+    if (!lt) return 0;
+    if (lt->k != TK_EL) return 2;
+    r->c = plc_loc_cell(p, m->buf + off, bit, lt, NULL);
+    r->bit = lt->cls == TC_BOOL;
+    return 1;
+}
+
+int plc_tag_index(plc_t *p, const char *name)
+{
+    int32_t ti = smap_get(&p->tag_exact, name);
+    if (ti < 0) {
+        char low[192];
+        to_lower(name, low, sizeof low);
+        ti = smap_get(&p->tag_lower, low);
+    }
+    return ti;
+}
+
 ref_t plc_resolve(plc_t *p, const members_t *mem, const char *raw_in)
 {
     ref_t r;
@@ -657,6 +762,16 @@ ref_t plc_resolve(plc_t *p, const members_t *mem, const char *raw_in)
         r.bit = (a.k == CK_BIT);
         return r;
     }
+    /* TIA spellings: #member (local), "Tag" (global) */
+    size_t sl = strlen(s);
+    if (s[0] == '#' && s[1] && (isalpha((unsigned char)s[1]) || s[1] == '_')) {
+        bool ident = true;
+        for (const char *q = s + 1; *q; q++) ident = ident && (isalnum((unsigned char)*q) || *q == '_');
+        if (ident) s++;
+    } else if (sl >= 2 && s[0] == '"' && s[sl - 1] == '"' && !memchr(s + 1, '"', sl - 2)) {
+        s[sl - 1] = 0;
+        s++;
+    }
     char low[192];
     to_lower(s, low, sizeof low);
     if (mem && mem->n) {
@@ -666,6 +781,11 @@ ref_t plc_resolve(plc_t *p, const members_t *mem, const char *raw_in)
             r.bit = mem->is_bool[mi] != 0;
             return r;
         }
+    }
+    /* a path into a structured member or a data block: "Data".values[3], #rec.flag */
+    if (strpbrk(s, ".[")) {
+        int k = resolve_path(p, mem, s, &r);
+        if (k) return r;
     }
     int32_t ti = smap_get(&p->tag_exact, s);
     if (ti < 0) ti = smap_get(&p->tag_lower, low);
@@ -1006,6 +1126,42 @@ static void mark_called_in(plc_t *p, int list)
     }
 }
 
+/* a name from SCL code or an interface member type: the blocks it calls */
+static void mark_name(void *ctx, const char *raw)
+{
+    plc_t *p = (plc_t *)ctx;
+    char nm[160];
+    trim_copy(raw, nm, sizeof nm);
+    size_t o = 0;
+    for (size_t i = 0; nm[i]; i++)
+        if (nm[i] != '"') nm[o++] = nm[i];
+    nm[o] = 0;
+    char tr[160];
+    trim_copy(nm, tr, sizeof tr);
+    if (!*tr) return;
+    for (size_t i = 0; i < p->nblocks; i++) {
+        blk_t *b = &p->blocks[i];
+        if (!ieq(b->name, tr)) continue;
+        if (b->type != BT_DB) b->called = 1;
+        else {
+            char idb[160];
+            jget_str(p, b->json, "instanceOf", idb, sizeof idb);
+            blk_t *fb = *idb ? find_block(p, idb) : NULL;
+            if (fb) fb->called = 1;
+        }
+    }
+}
+static void mark_member_types(plc_t *p, int arr, int depth)
+{
+    char dt[256];
+    for (int m = jd_first(D, arr); m >= 0 && depth < 16; m = jd_next(D, m)) {
+        if (jd_type(D, m) != JD_OBJ) continue;
+        jget_str(p, m, "dataType", dt, sizeof dt);
+        mark_name(p, dt);
+        mark_member_types(p, jd_get(D, m, "members"), depth + 1);
+    }
+}
+
 static void mark_called(plc_t *p)
 {
     for (size_t i = 0; i < p->nblocks; i++) {
@@ -1016,89 +1172,183 @@ static void mark_called(plc_t *p)
             mark_called_in(p, jarr(p, n, "boxes"));
         }
     }
+    /* SCL: blocks named in a call ("FC"(..), "InstanceDB"(..)) and FBs used as
+     * the type of an interface member (multi-instances) are not orphans
+     * (sim.js collectCalledIds) */
+    for (size_t i = 0; i < p->nblocks; i++) {
+        blk_t *b = &p->blocks[i];
+        if (b->lang == BL_SCL) {
+            int cv = jd_get(D, b->json, "code");
+            size_t len = cv >= 0 ? jd_str(D, cv, NULL, 0) : 0;
+            if (len) {
+                char *src = (char *)h_alloc(p, len + 1);
+                if (!src) oom(p);
+                jd_str(D, cv, src, len + 1);
+                plc_scl_called(src, mark_name, p);
+                h_free(p, src);
+            }
+        }
+        int iface = jd_get(D, b->json, "iface");
+        if (jd_type(D, iface) == JD_OBJ)
+            for (int k = jd_first(D, iface); k >= 0; k = jd_next(D, k)) mark_member_types(p, k + 1, 0);
+    }
 }
 
 /* ======================================================================== *
  *  Compile: units (block instances)                                          *
  * ======================================================================== */
-static uint8_t is_bool_type(const char *dt) { return strcmp(dt, "Bool") == 0; }
+/* ---- block types (cached per block) ---- */
+blk_t *plc_find_block_id(plc_t *p, const char *id) { return find_block(p, id); }
 
-/* "<inst>.<member>" cell, initialised to the declared default the first time
- * (sim.js buildScope: boolDefault / numDefault) */
-static cref_t member_cell(plc_t *p, const char *inst, const char *mname, const char *dtype, const char *def)
+const ty_t *plc_block_type(plc_t *p, blk_t *b)
 {
-    char key[256];
-    snprintf(key, sizeof key, "%s.%s", inst, mname);
-    uint8_t st = sym_type_for(dtype);
-    cref_t c = sym_cell(p, key, st, NULL);
-    if (c.k != CK_SYM) return c;
-    sym_t *s = &p->syms[c.idx];
-    if (!s->written) {
-        s->type = st;
-        char d[64];
-        trim_copy(def, d, sizeof d);
-        if (st == SYM_BOOL) {
-            s->v = pvb(ieq(d, "1") || ieq(d, "true") || ieq(d, "on") || ieq(d, "yes"));
-        } else if (!strcmp(dtype, "Time")) {
-            s->v = pvn(plc_parse_time_ms(d));
+    if (b->ty_state == 2) return b->ty;
+    if (b->ty_state == 3 || b->ty_state == 1) return NULL;
+    if (!p->doc) return NULL;            /* runtime: only what compile built */
+    b->ty_state = 1;
+    char err[200] = "";
+    const ty_t *t = NULL;
+    if (b->type == BT_DB) {
+        int io = jd_get(D, b->json, "instanceOf"), dt = jd_get(D, b->json, "dbType");
+        char buf[160];
+        if (io >= 0 && jd_type(D, io) != JD_NULL && (jd_str(D, io, buf, sizeof buf), *buf)) {
+            blk_t *fb = find_block(p, buf);
+            if (!fb || fb->type != BT_FB) snprintf(err, sizeof err, "instance DB of a missing FB");
+            else {
+                t = plc_block_type(p, fb);
+                if (!t) snprintf(err, sizeof err, "%s", fb->ty_state == 1 ? "FB contains an instance of itself" : fb->ty_err ? fb->ty_err : "?");
+            }
+        } else if (dt >= 0 && jd_type(D, dt) != JD_NULL && (jd_str(D, dt, buf, sizeof buf), *buf)) {
+            char q[176], tr[160];
+            trim_copy(buf, tr, sizeof tr);
+            size_t l = strlen(tr);
+            if (l >= 2 && tr[0] == '"' && tr[l - 1] == '"') tr[l - 1] = 0, memmove(tr, tr + 1, l - 1);
+            snprintf(q, sizeof q, "\"%s\"", tr);
+            t = ty_parse(p, q, -1, err, sizeof err);
         } else {
-            double v = js_parse_float(d);
-            s->v = pvn(isnan(v) ? 0 : v);
+            t = ty_struct_of(p, jd_get(D, b->json, "members"), b->name, err, sizeof err);
         }
-        s->written = 1;
+    } else {
+        t = ty_block_fields(p, b, err, sizeof err);
     }
-    return c;
+    if (t && t->size > 65534) {
+        t = NULL;
+        snprintf(err, sizeof err, "instance data larger than 64 KB");
+    }
+    if (!t) {
+        b->ty_state = 3;
+        b->ty_err = ar_dup(p, err);
+        return NULL;
+    }
+    b->ty = t;
+    b->ty_state = 2;
+    return t;
 }
 
-static const char *const SECT_FB[] = {"input", "output", "inout", "static", "temp", "constant", NULL};
-static const char *const SECT_FC[] = {"input", "output", "inout", "temp", "constant", NULL};
-static const char *const SECT_OB[] = {"temp", "constant", NULL};
+/* ---- memories ---- */
+static mem_t *mem_find(plc_t *p, const char *name)
+{
+    for (mem_t *m = p->mems; m; m = m->next)
+        if (!strcmp(m->name, name)) return m;
+    return NULL;
+}
+/* a memory for type t: its own zeroed buffer with start values, or a view
+ * into a parent's buffer (already initialised); top-level elementary
+ * members get CK_LOC cells named "<name>.<member>" for the snapshot */
+static mem_t *mem_new(plc_t *p, const char *name, const ty_t *t, uint8_t *view)
+{
+    mem_t *m = (mem_t *)plc_ar_alloc(p, sizeof(mem_t));
+    m->name = ar_dup(p, name);
+    m->t = t;
+    m->refs = (vref_t *)plc_ar_alloc(p, sizeof(vref_t) * (t->nf + 1u));
+    if (view) m->buf = view;
+    else {
+        m->buf = (uint8_t *)plc_ar_alloc(p, t->size ? t->size : 1);
+        ty_init(p, m->buf, 0, t, NULL);
+    }
+    m->next = p->mems;
+    p->mems = m;
+    char key[256];
+    for (uint16_t i = 0; i < t->nf; i++) {
+        const fld_t *f = &t->f[i];
+        if (f->t->k != TK_EL) continue;
+        snprintf(key, sizeof key, "%s.%s", name, f->name);
+        plc_loc_cell(p, m->buf + f->off, f->bit, f->t, ar_dup(p, key));
+    }
+    return m;
+}
 
-static void build_members(plc_t *p, unit_t *u)
+/* the memory of a data block (created with its start values at compile time) */
+mem_t *plc_db_mem(plc_t *p, blk_t *db)
+{
+    if (db->dbm) return db->dbm;
+    if (!p->doc) return NULL;
+    const ty_t *t = plc_block_type(p, db);
+    if (!t) return NULL;
+    mem_t *m = mem_new(p, db->name, t, NULL);
+    ty_start_values(p, m->buf, t, jd_get(D, db->json, "startValues"));
+    db->dbm = m;
+    return m;
+}
+
+static void build_members(plc_t *p, unit_t *u, uint8_t *view)
 {
     blk_t *b = u->blk;
-    int iface = jd_get(D, b->json, "iface");
-    if (jd_type(D, iface) != JD_OBJ) return;
-    const char *const *secs = b->type == BT_FB ? SECT_FB : b->type == BT_FC ? SECT_FC : SECT_OB;
-    int total = 0;
-    for (int s = 0; secs[s]; s++) total += (int)jd_count(D, jarr(p, iface, secs[s]));
-    if (!total) return;
-    u->mem.cell = (cref_t *)plc_ar_alloc(p, sizeof(cref_t) * (size_t)total);
-    u->mem.is_bool = (uint8_t *)plc_ar_alloc(p, (size_t)total);
-    char name[128], dtype[32], def[64], low[128];
-    for (int s = 0; secs[s]; s++) {
-        int arr = jarr(p, iface, secs[s]);
-        for (int m = jd_first(D, arr); m >= 0; m = jd_next(D, m)) {
-            if (jd_type(D, m) != JD_OBJ) continue;
-            jget_str(p, m, "name", name, sizeof name);
-            char nm[128];
-            trim_copy(name, nm, sizeof nm);
-            if (!*nm) continue;
-            jget_str(p, m, "dataType", dtype, sizeof dtype);
-            jget_str(p, m, "default", def, sizeof def);
-            int i = u->mem.n++;
-            u->mem.cell[i] = member_cell(p, u->inst, name, dtype, def);
-            u->mem.is_bool[i] = is_bool_type(dtype);
-            to_lower(name, low, sizeof low);
-            smap_put(p, &u->mem.map, ar_dup(p, low), i); /* last one wins (scope object) */
-        }
+    const ty_t *t = plc_block_type(p, b);
+    if (!t) {
+        u->norun = true;
+        u->bad = true;
+        return;
     }
+    mem_t *m = mem_find(p, u->inst);
+    if (!m) {
+        /* an FB instance whose name is a data block: that DB's memory */
+        blk_t *db = plc_find_block_name(p, u->inst);
+        if (db && db->type == BT_DB) m = plc_db_mem(p, db);
+    }
+    if (m && !ty_same(p, m->t, t)) m = NULL;
+    if (m && view && m->buf != view) m = NULL;
+    if (!m) m = mem_new(p, u->inst, t, view);
+    u->mem.t = t;
+    u->mem.m = m;
+    if (!t->nf) return;
+    u->mem.cell = (cref_t *)plc_ar_alloc(p, sizeof(cref_t) * t->nf);
+    u->mem.is_bool = (uint8_t *)plc_ar_alloc(p, t->nf);
+    char low[128];
+    for (uint16_t i = 0; i < t->nf; i++) {
+        const fld_t *f = &t->f[i];
+        if (f->t->k == TK_EL) {
+            u->mem.cell[i] = plc_loc_cell(p, m->buf + f->off, f->bit, f->t, NULL);
+            u->mem.is_bool[i] = f->t->cls == TC_BOOL;
+        } else u->mem.cell[i] = mkref(CK_NONE, 0, 0, 0, 0);
+        to_lower(f->name, low, sizeof low);
+        smap_put(p, &u->mem.map, ar_dup(p, low), (int32_t)i); /* last one wins (scope object) */
+    }
+    u->mem.n = t->nf;
 }
 
-static unit_t *unit_get(plc_t *p, blk_t *b, const char *inst)
+/* the unit (compiled instance) of block b with instance name inst; view: a
+ * multi-instance inside the parent's buffer */
+unit_t *plc_unit_for(plc_t *p, blk_t *b, const char *inst, uint8_t *view, unit_t *parent)
 {
     for (unit_t *u = p->units; u; u = u->next)
         if (u->blk == b && strcmp(u->inst, inst) == 0) return u;
     unit_t *u = (unit_t *)plc_ar_alloc(p, sizeof(unit_t));
     u->blk = b;
     u->inst = ar_dup(p, inst);
+    u->parent = parent;
+    for (unit_t *a = parent; a; a = a->parent)
+        if (a->blk == b) u->norun = true; /* recursive call: never runs (sim.js cycle guard) */
     u->next = p->units;
     p->units = u;
-    build_members(p, u);
+    build_members(p, u, view);
+    if (u->norun) u->compiled = true;
     u->pend = p->pending;
     p->pending = u;
     return u;
 }
+
+static unit_t *unit_get(plc_t *p, blk_t *b, const char *inst) { return plc_unit_for(p, b, inst, NULL, NULL); }
 
 /* ======================================================================== *
  *  Compile: elements / boxes                                                 *
@@ -1125,7 +1375,7 @@ static call_t *compile_call(plc_t *p, unit_t *u, int el, const char *elid, bool 
     int iface = jd_get(D, tb->json, "iface");
     int args = jd_get(D, el, "args");
     const char *in_secs[] = {"input", "inout", NULL};
-    const char *out_secs[] = {"output", "inout", NULL};
+    const char *out_secs[] = {"output", "inout", tb->type == BT_FC ? "return" : NULL, NULL};
     for (int dir = 0; dir < 2; dir++) {
         const char **secs = dir == 0 ? in_secs : out_secs;
         int total = 0;
@@ -1142,10 +1392,13 @@ static call_t *compile_call(plc_t *p, unit_t *u, int el, const char *elid, bool 
                 trim_copy(name, nm, sizeof nm);
                 if (!*nm) continue;
                 jget_str(p, m, "dataType", dtype, sizeof dtype);
-                jget_str(p, m, "default", def, sizeof def);
+                (void)def;
                 cparam_t *cp = &arr[n++];
-                cp->mem = member_cell(p, inst, name, dtype, def);
-                cp->is_bool = is_bool_type(dtype);
+                char low[128];
+                to_lower(nm, low, sizeof low);
+                int32_t mi = c->u->mem.n ? smap_get(&c->u->mem.map, low) : -1;
+                cp->mem = mi >= 0 ? c->u->mem.cell[mi] : mkref(CK_NONE, 0, 0, 0, 0);
+                cp->is_bool = strcmp(dtype, "Bool") == 0;
                 cp->pin = -1;
                 cp->arg = mkref(CK_NONE, 0, 0, 0, 0);
                 if (fbd) {
@@ -1467,8 +1720,12 @@ static void compile_unit_body(plc_t *p, unit_t *u)
         char *src = (char *)h_alloc(p, len + 1);
         if (!src) oom(p);
         jd_str(D, cv, src, len + 1);
-        char err[160];
-        u->scl_ok = plc_scl_compile(p, &u->mem, src, &u->scl, err, sizeof err, b->name);
+        char err[200];
+        u->scl_ok = plc_scl_compile(p, u, src, &u->scl, err, sizeof err);
+        if (!u->scl_ok && !b->warned) {
+            b->warned = 1;
+            plc_warnf(p, "SCL block \"%s\": %s (block is skipped)", *b->name ? b->name : "?", err);
+        }
         h_free(p, src);
         return;
     }
@@ -1726,6 +1983,29 @@ static void sort_blocks(blk_t **v, size_t n)
     }
 }
 
+/* project.types: the PLC data types (UDTs), first one of a name wins */
+static void compile_types(plc_t *p)
+{
+    int arr = jarr(p, 0, "types");
+    uint32_t cnt = jd_count(D, arr);
+    if (!cnt) return;
+    p->udt_json = (int *)plc_ar_alloc(p, sizeof(int) * cnt);
+    p->udt_name = (const char **)plc_ar_alloc(p, sizeof(char *) * cnt);
+    p->udt_ty = (const ty_t **)plc_ar_alloc(p, sizeof(ty_t *) * cnt);
+    p->udt_state = (uint8_t *)plc_ar_alloc(p, cnt);
+    char nm[160];
+    for (int t = jd_first(D, arr); t >= 0; t = jd_next(D, t)) {
+        if (jd_type(D, t) != JD_OBJ) continue;
+        jget_str(p, t, "name", nm, sizeof nm);
+        char tr[160];
+        trim_copy(nm, tr, sizeof tr);
+        if (!*tr) continue;
+        p->udt_json[p->nudt] = t;
+        p->udt_name[p->nudt] = ar_dup(p, nm);
+        p->nudt++;
+    }
+}
+
 static void compile_project(plc_t *p)
 {
     char buf[200];
@@ -1738,24 +2018,15 @@ static void compile_project(plc_t *p)
 
     compile_tags(p);
     index_blocks(p);
+    compile_types(p);
     mark_called(p);
     compile_io(p);
 
-    /* SCL syntax problems are reported once per block, whether or not it runs */
+    /* every data block's memory exists from the start (with its start values) */
     for (size_t i = 0; i < p->nblocks; i++) {
         blk_t *b = &p->blocks[i];
-        if (b->type == BT_DB || b->lang != BL_SCL) continue;
-        int cv = jd_get(D, b->json, "code");
-        size_t len = cv >= 0 ? jd_str(D, cv, NULL, 0) : 0;
-        if (!len) continue;
-        char *src = (char *)h_alloc(p, len + 1);
-        if (!src) oom(p);
-        jd_str(D, cv, src, len + 1);
-        char err[160];
-        void *dummy = NULL;
-        if (!plc_scl_compile(NULL, NULL, src, (struct scl_stmt **)&dummy, err, sizeof err, b->name))
-            plc_warnf(p, "SCL block \"%s\": %s (block is skipped)", *b->name ? b->name : "?", err);
-        h_free(p, src);
+        if (b->type != BT_DB) continue;
+        if (!plc_db_mem(p, b)) plc_warnf(p, "Data block \"%s\": %s", *b->name ? b->name : "?", b->ty_err ? b->ty_err : "?");
     }
 
     /* execution list: every OB by number, then FC/FB nobody calls (sim.js scanOnce) */
@@ -1937,7 +2208,7 @@ static void run_unit(plc_t *p, unit_t *u);
 static void lad_call(plc_t *p, node_t *n)
 {
     call_t *c = n->call;
-    if (!c || !c->u || c->u->blk->active) return; /* missing target / cycle guard */
+    if (!c || !c->u || c->u->blk->active || c->u->bad) return; /* missing target / cycle guard / type error */
     /* sample every argument in the caller's scope first, then copy in */
     for (uint16_t i = 0; i < c->nin; i++) {
         cparam_t *cp = &c->ins[i];
@@ -2122,7 +2393,7 @@ static double sem_val(plc_t *p, node_t *n, int s, int slot)
 static void fbd_call(plc_t *p, node_t *n, bool en)
 {
     call_t *c = n->call;
-    if (!en || !c || !c->u || c->u->blk->active) return;
+    if (!en || !c || !c->u || c->u->blk->active || c->u->bad) return;
     for (uint16_t i = 0; i < c->nin; i++) {
         cparam_t *cp = &c->ins[i];
         if (cp->pin < 0) continue;
@@ -2325,7 +2596,7 @@ static void fbd_net(plc_t *p, net_t *net)
 static void run_unit(plc_t *p, unit_t *u)
 {
     blk_t *b = u->blk;
-    if (b->active) return;
+    if (b->active || u->norun) return;
     if (p->depth >= PLC_MAX_CALL_DEPTH) {
         plc_errorf(p, "%s: block call nesting deeper than %d - call skipped", *b->name ? b->name : "?",
                    PLC_MAX_CALL_DEPTH);
@@ -2334,7 +2605,7 @@ static void run_unit(plc_t *p, unit_t *u)
     b->active = 1;
     p->depth++;
     if (b->lang == BL_SCL) {
-        if (u->scl_ok && u->scl) plc_scl_run(p, u->scl, b->name);
+        if (u->scl_ok && u->scl) plc_scl_run(p, u);
     } else {
         for (uint16_t i = 0; i < u->nnet; i++) {
             net_t *net = &u->nets[i];
@@ -2345,6 +2616,8 @@ static void run_unit(plc_t *p, unit_t *u)
     p->depth--;
     b->active = 0;
 }
+
+void plc_run_unit(plc_t *p, unit_t *u) { run_unit(p, u); }
 
 void plc_scan(plc_t *p)
 {
@@ -2361,6 +2634,7 @@ void plc_scan(plc_t *p)
 static void plc_destroy(plc_t *p)
 {
     if (!p) return;
+    plc_conns_close(p);
     /* unit structs live in the arena: release their heap maps first */
     for (unit_t *u = p->units; u; u = u->next) smap_free(p, &u->mem.map);
     ar_chunk_t *c = p->ar.head;
@@ -2370,6 +2644,7 @@ static void plc_destroy(plc_t *p)
         c = nx;
     }
     h_free(p, p->syms);
+    h_free(p, p->locs);
     h_free(p, p->lits);
     h_free(p, p->regs);
     h_free(p, p->live);
@@ -2490,9 +2765,11 @@ double plc_io_get_output(plc_t *p, size_t i)
     return io->dir == PLC_IO_OUT ? (truthy(v) ? 1.0 : 0.0) : numv(v);
 }
 
-static bool same_cell(cref_t a, cref_t b)
+static bool same_cell(plc_t *p, cref_t a, cref_t b)
 {
     if (a.k == CK_SYM || b.k == CK_SYM) return a.k == b.k && a.idx == b.idx;
+    if (a.k == CK_LOC || b.k == CK_LOC)
+        return a.k == b.k && p->locs[a.idx].ptr == p->locs[b.idx].ptr && p->locs[a.idx].bit == p->locs[b.idx].bit;
     if (a.k == CK_NONE || a.k == CK_LIT || b.k == CK_NONE || b.k == CK_LIT) return false;
     /* address cells: same storage bytes */
     return a.area == b.area && a.off == b.off && a.k == b.k && a.bit == b.bit;
@@ -2514,7 +2791,7 @@ int plc_force(plc_t *p, const char *key, plc_vtype_t t, double value)
     if (r.c.k == CK_NONE || r.c.k == CK_LIT) return -1;
     for (size_t i = 0; i < p->nio; i++) {
         plc_io_t *io = &p->io[i];
-        if (!same_cell(p->iocell[io->cell], r.c)) continue;
+        if (!same_cell(p, p->iocell[io->cell], r.c)) continue;
         if (t == PLC_V_NULL) {
             io->forced = false;
         } else {
@@ -2577,6 +2854,14 @@ void plc_snapshot_json(plc_t *p, jw_t *w)
             jw_key(w, s->name);
             jw_pv(w, s->v);
         }
+        for (size_t i = 0; i < p->nlocs; i++) {
+            loc_t *l = &p->locs[i];
+            if (!l->name) continue;
+            jw_key(w, l->name);
+            double v = ty_read(l->ptr, l->bit, l->t);
+            if (l->t->cls == TC_BOOL) jw_bool(w, v != 0);
+            else jw_num(w, v);
+        }
         for (size_t i = 0; i < p->nregs; i++) {
             areg_t *r = &p->regs[i];
             if (!r->touched) continue;
@@ -2612,6 +2897,39 @@ void plc_snapshot_json(plc_t *p, jw_t *w)
             if (io->dir == PLC_IO_IN || io->dir == PLC_IO_OUT) jw_bool(w, io->force_val != 0);
             else jw_num(w, io->force_val);
         }
+    jw_obj_end(w);
+}
+
+void plc_dbs_json(plc_t *p, jw_t *w, const char *only)
+{
+    static const char HEX[] = "0123456789abcdef";
+    jw_obj(w);
+    for (size_t i = 0; p && i < p->nblocks; i++) {
+        blk_t *b = &p->blocks[i];
+        if (b->type != BT_DB || !b->dbm || !*b->name) continue;
+        if (only) {
+            /* comma-separated list, exact names */
+            bool hit = false;
+            size_t nl = strlen(b->name);
+            for (const char *q = only; *q;) {
+                const char *e = strchr(q, ',');
+                size_t l = e ? (size_t)(e - q) : strlen(q);
+                if (l == nl && !memcmp(q, b->name, l)) hit = true;
+                q += l + (e ? 1 : 0);
+            }
+            if (!hit) continue;
+        }
+        size_t n = b->dbm->t->size;
+        char *hex = (char *)h_alloc(p, n * 2 + 1);
+        if (!hex) continue;
+        for (size_t k = 0; k < n; k++) {
+            hex[2 * k] = HEX[b->dbm->buf[k] >> 4];
+            hex[2 * k + 1] = HEX[b->dbm->buf[k] & 15];
+        }
+        jw_key(w, b->name);
+        jw_strn(w, hex, n * 2);
+        h_free(p, hex);
+    }
     jw_obj_end(w);
 }
 
@@ -2660,13 +2978,4 @@ void plc_modbus_map_json(const plc_t *p, jw_t *w, unsigned bank)
             jw_obj_end(w);
         }
     jw_obj_end(w);
-}
-
-/* ---------------------------------------------------------------- OUC (stubs until the OUC engine lands) */
-void plc_comm_reset(plc_t *p) { (void)p; }
-void plc_conns_json(plc_t *p, jw_t *w)
-{
-    (void)p;
-    jw_arr(w);
-    jw_arr_end(w);
 }

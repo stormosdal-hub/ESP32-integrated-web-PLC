@@ -172,7 +172,8 @@
         const ln = t.line;
         if (peek() && peek().t === 'p' && (peek().v === ':' || peek().v === '=')) p++;
         const s = p;
-        while (p < toks.length && toks[p].line === ln && toks[p].t !== 'cmt') p++;
+        if (u === 'VERSION') { if (p < toks.length && toks[p].line === ln && toks[p].t === 'num') p++; }
+        else while (p < toks.length && toks[p].line === ln && toks[p].t !== 'cmt') p++;
         const v = s < p ? textOf(text, toks[s], toks[p - 1]).trim() : '';
         if (u === 'VERSION') unit.version = v;
         if (u === 'TITLE') unit.title = v;
@@ -236,7 +237,8 @@
         const ln = t.line;
         if (toks[p] && toks[p].t === 'p' && (toks[p].v === ':' || toks[p].v === '=')) p++;
         const s = p;
-        while (p < toks.length && toks[p].line === ln && toks[p].t !== 'cmt') p++;
+        if (u === 'VERSION') { if (p < toks.length && toks[p].line === ln && toks[p].t === 'num') p++; }
+        else while (p < toks.length && toks[p].line === ln && toks[p].t !== 'cmt') p++;
         if (u === 'VERSION' && s < p) unit.version = textOf(text, toks[s], toks[p - 1]).trim();
         continue;
       }

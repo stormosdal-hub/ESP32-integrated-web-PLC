@@ -16,6 +16,12 @@ static double now_ms(void *u)
     (void)u;
     return g_now;
 }
+/* the same deterministic wall clock as js_ref.js (RD_SYS_T / RD_LOC_T) */
+static double wall_ms(void *u, bool local)
+{
+    (void)u;
+    return 1700000000000.0 + g_now + (local ? 3600000.0 : 0.0);
+}
 
 /* Poisoning allocator: freed blocks are overwritten with 0xFE so any
  * use-after-free in the engine fails loudly in the fuzz/parity runs instead
@@ -74,11 +80,13 @@ int main(int argc, char **argv)
         fprintf(stderr, "cannot read input\n");
         return 2;
     }
-    plc_env_t env = {now_ms, NULL, dbg_alloc, dbg_alloc, dbg_free};
+    plc_env_t env = {now_ms, NULL, dbg_alloc, dbg_alloc, dbg_free, wall_ms, NULL};
     char err[256];
     plc_t *p = plc_load(proj, plen, &env, err, sizeof err);
     if (!p) {
         printf("{\"error\":\"%s\"}", err);
+        free(proj);
+        free(steps);
         return 1;
     }
     jd_doc_t d;
@@ -116,6 +124,10 @@ int main(int argc, char **argv)
         }
         jw_obj(&w);
         plc_snapshot_json(p, &w);
+        jw_key(&w, "dbs");
+        plc_dbs_json(p, &w, NULL);
+        jw_key(&w, "conns");
+        plc_conns_json(p, &w);
         jw_obj_end(&w);
     }
     jw_arr_end(&w);

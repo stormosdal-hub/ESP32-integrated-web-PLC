@@ -997,7 +997,11 @@
         if (!TY.sameLayout(src.ty, lhs.ty)) throw E('Cannot assign ' + tname(src.ty) + ' to ' + tname(lhs.ty), s);
         return { s: 'copy', p: lhs, src, size: lhs.ty.size };
       }
-      case 'callst': return { s: 'call', c: callC(cx, s.c, false) };
+      case 'callst': {
+        const c = callC(cx, s.c, false);
+        // a function as a statement (RD_SYS_T(OUT => #t);): evaluate, drop the value
+        return c.op === 'call' ? { s: 'call', c } : { s: 'set', p: null, e: c };
+      }
       case 'if': return { s: 'if', arms: s.arms.map((a) => ({ c: condC(cx, a.cond), body: blockC(cx, a.body) })), els: s.els ? blockC(cx, s.els) : null };
       case 'case': {
         const sel = exprC(cx, s.sel);
@@ -1345,7 +1349,7 @@
   }
   function runS(s, ctx) {
     switch (s.s) {
-      case 'set': writeP(s.p, ctx, evalE(s.e, ctx)); return 0;
+      case 'set': { const v = evalE(s.e, ctx); if (s.p) writeP(s.p, ctx, v); return 0; }
       case 'sets': {
         const L = locOf(s.p, ctx);
         if (L) TY.strWrite(L.buf, L.off, s.p.ty, evalE(s.e, ctx));

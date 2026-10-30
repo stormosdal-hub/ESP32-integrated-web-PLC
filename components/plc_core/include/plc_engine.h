@@ -188,6 +188,10 @@ size_t plc_forced_count(const plc_t *p);
  * "forced" into the object currently open in w. */
 void plc_snapshot_json(plc_t *p, jw_t *w);
 void plc_tags_json(const plc_t *p, jw_t *w);            /* array of {name,dataType,address,comment} */
+/* data block contents: object {"<DB name>": "<hex bytes>"} — every DB, or only
+ * the comma-separated names in `only` (the IDE decodes them with its own
+ * copy of the layout rules, web/js/types.js) */
+void plc_dbs_json(plc_t *p, jw_t *w, const char *only);
 void plc_modbus_map_json(const plc_t *p, jw_t *w, unsigned bank); /* object tag -> {kind,address[,registers]} */
 uint32_t plc_error_count(const plc_t *p);
 const char *plc_last_error(const plc_t *p);

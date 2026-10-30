@@ -14,6 +14,9 @@ const project = kase.project;
 T.setProject(project);
 T.mem.reset();
 T.sim.reset();
+// the same deterministic wall clock as plc_cli.c (RD_SYS_T / RD_LOC_T)
+T.sim.wallMs = (local) => 1700000000000 + clock.now + (local ? 3600000 : 0);
+const hex = (buf) => Array.from(buf, (x) => (x < 16 ? '0' : '') + x.toString(16)).join('');
 
 function record() {
   const mem = {};
@@ -36,7 +39,13 @@ function record() {
       }
     }
   }
-  return { mem, live, power, pins };
+  // every data block, byte for byte (types.js layout = plc_types.c layout)
+  const dbs = {};
+  for (const b of project.blocks) {
+    if (b.type !== 'DB' || !b.name) continue;
+    try { dbs[b.name] = hex(T.inst.db(b).buf); } catch (e) { /* type error: the C engine has no memory either */ }
+  }
+  return { mem, live, power, pins, dbs, conns: T.ouc.list() };
 }
 
 const out = { steps: [] };

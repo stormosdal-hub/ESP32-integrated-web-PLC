@@ -398,4 +398,384 @@ const pulse = (k, extra) => [{ set: Object.assign({ [k]: true }, extra || {}) },
   save('scl', p, steps);
 })();
 
+/* ------------------------------------------- 9. typed SCL from source */
+// Projects built the way a user builds them from TIA sources: generate the
+// blocks with T.sources (the IDE's "Generate blocks from source").
+function fromSource(p, text) {
+  T.setProject(p);
+  const r = T.sources.generate(text);
+  if (r.errors.length) throw new Error(p.name + ': ' + JSON.stringify(r.errors));
+  p.blocks.forEach((b) => { if (b.lang === 'SCL') { const c = T.scl.check(b); if (c.error) throw new Error(p.name + ' ' + b.name + ': ' + JSON.stringify(c.error)); } });
+  return p;
+}
+
+(function sclTyped() {
+  const p = project('SclTyped');
+  ['I0.0 A', 'I0.1 B', 'I0.2 C'].forEach((x) => { const [a, n] = x.split(' '); tag(p, n, 'Bool', a); });
+  tag(p, 'IntOut', 'Int', 'MW0'); tag(p, 'Div', 'Int', 'MW2'); tag(p, 'RealOut', 'Real', 'MD4');
+  tag(p, 'Flag', 'Bool', 'M8.0'); tag(p, 'TimeOut', 'Time', 'MD12'); tag(p, 'Sym', 'Int', '');
+  tag(p, 'LadBit', 'Bool', 'M20.0'); tag(p, 'LadNum', 'Int', 'MW22'); tag(p, 'RetOut', 'Int', 'MW24');
+  fromSource(p, `
+TYPE "Point"
+VERSION : 0.1
+   STRUCT
+      x : Int := 3;
+      y : Real := 1.5;
+      tag : String[8] := 'pt';
+      flags : Array[0..9] of Bool;
+   END_STRUCT;
+END_TYPE
+
+FUNCTION "Sum" : DInt
+VERSION : 0.1
+   VAR_INPUT
+      arr : Variant;
+      n : Int;
+   END_VAR
+   VAR_IN_OUT
+      p : "Point";
+   END_VAR
+   VAR_TEMP
+      i : Int;
+   END_VAR
+BEGIN
+   #Sum := UDINT_TO_DINT(CountOfElements(#arr)) * 100 + #n;
+   #p.x := #p.x + 1;
+   FOR #i := 0 TO 9 BY 3 DO
+      #p.flags[#i] := NOT #p.flags[#i];
+   END_FOR;
+END_FUNCTION
+
+FUNCTION_BLOCK "Inner"
+VERSION : 0.1
+   VAR_INPUT
+      go : Bool;
+   END_VAR
+   VAR_OUTPUT
+      n : UInt;
+      edge : Bool;
+   END_VAR
+   VAR
+      trig : R_TRIG;
+      t : TON_TIME;
+      it : IEC_TIMER;
+   END_VAR
+BEGIN
+   #trig(CLK := #go);
+   #edge := #trig.Q;
+   IF #trig.Q THEN
+      #n := #n + 1;
+   END_IF;
+   #t(IN := #go, PT := T#30ms);
+   #it.TON(IN := #go, PT := T#50ms);
+END_FUNCTION_BLOCK
+
+FUNCTION_BLOCK "Worker"
+{ S7_Optimized_Access := 'FALSE' }
+VERSION : 0.1
+   VAR_INPUT
+      a : Bool;
+      pt : "Point";
+   END_VAR
+   VAR_OUTPUT
+      out : "Point";
+      w : Word;
+   END_VAR
+   VAR
+      seq : UInt := 65534;
+      s8 : SInt := 125;
+      b : Byte;
+      arr : Array[1..4, 0..2] of Int;
+      inner : "Inner";
+      cnt : CTU_DINT;
+      ts : DTL;
+      txt : String[12] := 'Hello';
+      t2 : String[4];
+      r : LReal;
+      stateNo : Int;
+      idx : Int := 7;
+      bad : Int;
+   END_VAR
+   VAR_TEMP
+      i : Int;
+      j : Int;
+      tmp : DInt;
+   END_VAR
+   VAR CONSTANT
+      ST_A : Int := 1;
+      ST_B : Int := 2;
+   END_VAR
+BEGIN
+   REGION arithmetic
+      #seq := #seq + 1;                     // wraps 65535 -> 0
+      #s8 := #s8 + 5;                       // SInt wrap
+      "Div" := 7 / 2 + (-7) / 2 + 7 MOD -3;
+      #b := 16#F0 OR BYTE#16#0F;
+      #b := SHL(IN := #b, N := 2);
+      #w := ROL(IN := WORD#16#8001, N := 1) XOR SHR(IN := WORD#16#FF00, N := 4);
+      #w.%X15 := #a;
+      #w.%B0 := 16#AB;
+      #r := SQRT(2.0) * 10.0 ** 2;
+      #tmp := TRUNC(-3.7) + ROUND(2.5) + ROUND(3.5) + CEIL(1.2) + FLOOR(-1.2);
+      "IntOut" := DINT_TO_INT(#tmp) + INT#1 + LIMIT(MN := 0, IN := 50, MX := 9) + MIN(4, 2, 8) + SEL(G := #a, IN0 := 100, IN1 := 200);
+      "RealOut" := NORM_X(MIN := 0, VALUE := 13824, MAX := 27648) + REAL#0.25 + INT_TO_REAL(3) / 2;
+      "TimeOut" := T#1s500ms + T#2s - T#250ms;
+   END_REGION
+   REGION arrays
+      FOR #i := 1 TO 4 DO
+         FOR #j := 0 TO 2 DO
+            #arr[#i, #j] := #i * 10 + #j;
+         END_FOR;
+      END_FOR;
+      #bad := #arr[#idx, 0];                // out of range: reads 0
+      #arr[#idx - 2, 1] := 99;            // out of range: ignored
+   END_REGION
+   REGION calls
+      #out := #pt;
+      #out.x := #out.x * 2;
+      #out.tag := CONCAT_LIKE;
+      "RetOut" := DINT_TO_INT("Sum"(arr := #arr, n := 7, p := #out));
+      #inner(go := #a, n => "Sym");
+      #cnt(CU := #inner.edge, R := "C", PV := 3);
+      "Flag" := #cnt.Q AND #inner.t.Q;
+      RD_SYS_T(OUT => #ts);
+   END_REGION
+   REGION strings
+      #t2 := #txt;                          // truncated to 4
+      IF #t2 = 'Hell' AND LEN(#txt) = 5 AND MAX_LEN(#t2) = 4 THEN
+         #stateNo := #ST_B;
+      END_IF;
+      CASE #stateNo OF
+         #ST_A: #stateNo := 10;
+         #ST_B: #stateNo := #stateNo + 20;
+         30..40: #stateNo := 0;
+      ELSE
+         #stateNo := -1;
+      END_CASE;
+   END_REGION
+END_FUNCTION_BLOCK
+
+DATA_BLOCK "Data"
+{ S7_Optimized_Access := 'FALSE' }
+VERSION : 0.1
+NON_RETAIN
+   VAR
+      p : "Point";
+      q : "Point";
+      list : Array[0..3] of "Point";
+      flags : Array[0..15] of Bool;
+      total : DInt;
+   END_VAR
+BEGIN
+   p.x := 42;
+   list[2].tag := 'third';
+   flags[3] := TRUE;
+END_DATA_BLOCK
+
+DATA_BLOCK "Worker_DB"
+VERSION : 0.1
+"Worker"
+BEGIN
+   seq := 65533;
+END_DATA_BLOCK
+
+ORGANIZATION_BLOCK "Cyclic"
+BEGIN
+   "Worker_DB"(a := "A", pt := "Data".p, out => "Data".q);
+   "Data".total := "Data".total + "Data".q.x;
+   "Data".list["Data".total MOD 4].x := 1;
+   "Data".flags[0] := "Data".flags[3] XOR "B";
+END_ORGANIZATION_BLOCK
+`.replace('#out.tag := CONCAT_LIKE;', "#out.tag := 'copy';"));
+  // a LAD network reading and writing DB elements by path
+  const ob = block(p, 'OB', 'Ladder', 9, 'LAD');
+  ob.networks = [
+    lad('db path', [stage([el('contact_no', '"Data".flags[0]')])], [el('coil', 'LadBit')]),
+    lad('move', [], [el('move', '', { in: '"Data".q.x', out: 'LadNum' })]),
+  ];
+  save('scl_typed', p, [{ t: 0, scans: 1 }, { set: { A: true }, scans: 1, dt: 20 }, { scans: 3, dt: 20 },
+    { set: { A: false }, scans: 2 }, { set: { A: true, B: true }, scans: 2, dt: 40 }, { set: { C: true }, scans: 1 },
+    { set: { A: false, C: false }, scans: 1 }, { set: { A: true }, scans: 5, dt: 15 }]);
+})();
+
+/* ------------------------------------------- 10. OUC over the virtual net */
+(function ouc() {
+  const p = project('Ouc');
+  tag(p, 'Go', 'Bool', 'I0.0'); tag(p, 'Drop', 'Bool', 'I0.1'); tag(p, 'Send', 'Bool', 'I0.2');
+  tag(p, 'Errors', 'Int', 'MW0'); tag(p, 'Got', 'Int', 'MW2');
+  fromSource(p, `
+FUNCTION_BLOCK "Peer"
+VERSION : 0.1
+   VAR_INPUT
+      go : Bool;
+      drop : Bool;
+      send : Bool;
+      active : Bool;
+      id : Int;
+      port : UInt;
+      lenRx : UDInt;
+      adhoc : Bool;
+   END_VAR
+   VAR_OUTPUT
+      st : Array[0..3] of Word;
+      got : Int;
+      errs : Int;
+      lastLen : UDInt;
+   END_VAR
+   VAR
+      p : TCON_IP_v4;
+      con : TCON;
+      dis : TDISCON;
+      snd : TSEND;
+      rcv : TRCV;
+      txb : Struct
+         a : Int;
+         b : Real;
+         c : String[6];
+      END_STRUCT;
+      rxb : Array[0..15] of Byte;
+      up : Bool;
+      cnt : Int;
+   END_VAR
+BEGIN
+   #p.ID := INT_TO_WORD(#id); #p.ConnectionType := 11; #p.ActiveEstablished := #active;
+   #p.RemoteAddress.ADDR[1] := 127; #p.RemoteAddress.ADDR[4] := 1;
+   IF #active THEN #p.RemotePort := #port; ELSE #p.LocalPort := #port; END_IF;
+   #con(REQ := #go AND NOT #up, ID := INT_TO_WORD(#id), CONNECT := #p);
+   IF #con.DONE THEN #up := TRUE; END_IF;
+   #dis(REQ := #drop, ID := INT_TO_WORD(#id));
+   IF #dis.DONE THEN #up := FALSE; END_IF;
+   #cnt := #cnt + 1;
+   #txb.a := #cnt; #txb.b := INT_TO_REAL(#cnt) / 4.0; #txb.c := 'abc';
+   #snd(REQ := #send, ID := INT_TO_WORD(#id), LEN := 0, DATA := #txb);
+   #rcv(EN_R := #up, ID := INT_TO_WORD(#id), LEN := #lenRx, ADHOC := #adhoc, DATA := #rxb);
+   IF #rcv.NDR THEN #got := #got + 1; #lastLen := #rcv.RCVD_LEN; END_IF;
+   IF #con.ERROR OR #dis.ERROR OR #snd.ERROR OR #rcv.ERROR THEN #errs := #errs + 1; END_IF;
+   #st[0] := #con.STATUS; #st[1] := #dis.STATUS; #st[2] := #snd.STATUS; #st[3] := #rcv.STATUS;
+END_FUNCTION_BLOCK
+
+DATA_BLOCK "Server" VERSION : 0.1 "Peer" BEGIN END_DATA_BLOCK
+DATA_BLOCK "Client" VERSION : 0.1 "Peer" BEGIN END_DATA_BLOCK
+DATA_BLOCK "Clash" VERSION : 0.1 "Peer" BEGIN END_DATA_BLOCK
+DATA_BLOCK "BadCon" VERSION : 0.1
+   VAR
+      p : TCON_IP_v4;
+      c1 : TCON; c2 : TCON; c3 : TCON; c4 : TCON;
+      s : Array[1..4] of Word;
+      big : Array[0..9] of Byte;
+      sx : TSEND;
+   END_VAR
+BEGIN END_DATA_BLOCK
+
+ORGANIZATION_BLOCK "Net"
+BEGIN
+   "Server"(go := "Go", drop := FALSE, send := "Send", active := FALSE, id := 1, port := 2000, lenRx := 4, adhoc := FALSE);
+   "Client"(go := "Go", drop := "Drop", send := "Send", active := TRUE, id := 2, port := 2000, lenRx := 0, adhoc := TRUE);
+   // a second listener on the same port, an ID in use, ID 0, port 0, bad address
+   "Clash"(go := "Go", drop := FALSE, send := FALSE, active := FALSE, id := 3, port := 2000, lenRx := 0, adhoc := FALSE);
+   "BadCon".p.ID := 1; "BadCon".p.ConnectionType := 11;
+   "BadCon".c1(REQ := "Go", ID := 1, CONNECT := "BadCon".p);
+   "BadCon".c2(REQ := "Go", ID := 0, CONNECT := "BadCon".p);
+   "BadCon".p.ID := 5;
+   "BadCon".c3(REQ := "Go", ID := 5, CONNECT := "BadCon".p);
+   "BadCon".p.ActiveEstablished := TRUE; "BadCon".p.RemotePort := 99; "BadCon".p.ID := 6;
+   "BadCon".c4(REQ := "Go", ID := 6, CONNECT := "BadCon".p);
+   "BadCon".s[1] := "BadCon".c1.STATUS; "BadCon".s[2] := "BadCon".c2.STATUS;
+   "BadCon".s[3] := "BadCon".c3.STATUS; "BadCon".s[4] := "BadCon".c4.STATUS;
+   "BadCon".sx(REQ := "Send", ID := 1, LEN := 11, DATA := "BadCon".big);
+   "Errors" := "Server".errs + "Client".errs;
+   "Got" := "Server".got * 100 + "Client".got;
+END_ORGANIZATION_BLOCK
+`);
+  save('ouc', p, [{ t: 0, scans: 1 }, { set: { Go: true }, scans: 1 }, { scans: 2 }, { set: { Send: true }, scans: 1 },
+    { set: { Send: false }, scans: 2 }, { set: { Send: true }, scans: 1 }, { set: { Send: false }, scans: 3 },
+    { set: { Drop: true }, scans: 2 }, { set: { Drop: false, Go: false }, scans: 2 }, { set: { Go: true }, scans: 3 },
+    { set: { Send: true }, scans: 1 }, { set: { Send: false }, scans: 2 }]);
+})();
+
+/* ------------------------------------- 11. the TcpLink example, end to end */
+(function tcplink() {
+  const p = project('TcpLink');
+  tag(p, 'Motor', 'Bool', 'Q0.0'); tag(p, 'Run_Lamp', 'Bool', 'Q0.1');
+  tag(p, 'Part_Count', 'Int', 'MW10'); tag(p, 'Conveyor_PWM', 'Real', 'MD20');
+  tag(p, 'ClientOn', 'Bool', 'M30.0'); tag(p, 'LinkUp', 'Bool', 'M30.1'); tag(p, 'RxSet', 'Int', 'MW32');
+  const ex = path.join(__dirname, '..', '..', 'examples', 'tcplink');
+  T.setProject(p);
+  ['TcpLinkTxDigital.udt', 'TcpLinkTxAnalog.udt', 'TcpLinkRx.udt', 'TcpLinkNames.udt', 'TcpLink.scl', 'TcpLinkDemo.db'].forEach((f) => {
+    const r = T.sources.generate(fs.readFileSync(path.join(ex, f), 'utf8'));
+    if (r.errors.length) throw new Error(f + ': ' + JSON.stringify(r.errors));
+  });
+  fromSource(p, `
+FUNCTION_BLOCK "TestClient"
+VERSION : 0.1
+   VAR_INPUT
+      on : Bool;
+   END_VAR
+   VAR_OUTPUT
+      msgs : UDInt;
+      names : UDInt;
+      bytes : UDInt;
+   END_VAR
+   VAR
+      p : TCON_IP_v4;
+      con : TCON;
+      dis : TDISCON;
+      rcv : TRCV;
+      snd : TSEND;
+      up : Bool;
+      buf : Array[0..4095] of Byte;
+      cmd : Struct
+         magic : Byte; ver : Byte; len : UInt; seq : UInt; flags : Byte; spare : Byte;
+         layout : Array[0..5] of Byte;
+         data : "TcpLinkRx";
+      END_STRUCT;
+      sendReq : Bool;
+   END_VAR
+   VAR_TEMP
+      i : Int;
+      len : Int;
+   END_VAR
+BEGIN
+   #p.ID := 7; #p.ConnectionType := 11; #p.ActiveEstablished := TRUE;
+   #p.RemoteAddress.ADDR[1] := 127; #p.RemoteAddress.ADDR[4] := 1; #p.RemotePort := 2000;
+   #con(REQ := #on AND NOT #up, ID := 7, CONNECT := #p);
+   IF #con.DONE THEN #up := TRUE; END_IF;
+   #dis(REQ := NOT #on AND #up, ID := 7);
+   IF #dis.DONE OR #dis.ERROR THEN #up := FALSE; END_IF;
+   #rcv(EN_R := #up, ID := 7, ADHOC := TRUE, DATA := #buf);
+   IF #rcv.NDR THEN
+      #bytes := #bytes + #rcv.RCVD_LEN;
+      #i := 0;
+      WHILE #i + 8 <= UDINT_TO_INT(#rcv.RCVD_LEN) DO
+         #len := WORD_TO_INT(SHL(IN := BYTE_TO_WORD(#buf[#i + 2]), N := 8) OR BYTE_TO_WORD(#buf[#i + 3]));
+         IF #buf[#i + 7] = 1 THEN #names := #names + 1; ELSE #msgs := #msgs + 1; END_IF;
+         IF #len <= 0 THEN EXIT; END_IF;
+         #i := #i + #len;
+      END_WHILE;
+   END_IF;
+   #sendReq := #up AND #msgs > 0 AND NOT #snd.BUSY AND #cmd.seq < 3;
+   IF #sendReq THEN
+      #cmd.magic := 16#5A; #cmd.ver := 3; #cmd.len := 80; #cmd.seq := #cmd.seq + 1;
+      #cmd.layout[0] := 2; #cmd.layout[1] := 4; #cmd.layout[3] := 12; #cmd.layout[4] := 4; #cmd.layout[5] := 4;
+      #cmd.data.bits[0] := NOT #cmd.data.bits[0]; #cmd.data.ints[0] := 1000 + UINT_TO_INT(#cmd.seq); #cmd.data.reals[3] := 2.5;
+   END_IF;
+   #snd(REQ := #sendReq, ID := 7, LEN := 80, DATA := #cmd);
+END_FUNCTION_BLOCK
+
+DATA_BLOCK "TestClient_DB" VERSION : 0.1 "TestClient" BEGIN END_DATA_BLOCK
+
+ORGANIZATION_BLOCK "ClientOB"
+BEGIN
+   "TestClient_DB"(on := "ClientOn");
+   "LinkUp" := "LinkData".status.connected;
+   "RxSet" := "LinkData".rx.ints[0];
+END_ORGANIZATION_BLOCK
+`);
+  const steps = [{ t: 0, scans: 2, dt: 50 }, { set: { ClientOn: true, Motor: true, Part_Count: 5, Conveyor_PWM: 0.5 }, scans: 6, dt: 50 },
+    { scans: 10, dt: 100 }, { set: { Part_Count: 6 }, scans: 3, dt: 50 }, { set: { Conveyor_PWM: 0.9 }, scans: 3, dt: 60 },
+    { scans: 25, dt: 100 }, { set: { ClientOn: false }, scans: 5, dt: 50 }, { scans: 30, dt: 100 },
+    { set: { ClientOn: true }, scans: 10, dt: 100 }, { set: { Run_Lamp: true }, scans: 4, dt: 50 }];
+  save('tcplink', p, steps);
+})();
+
 console.log('cases written to', outDir);
