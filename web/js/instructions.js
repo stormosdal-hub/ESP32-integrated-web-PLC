@@ -147,9 +147,10 @@
     // a labeled rectangle. Show 1–3 chars derived from the kind for recognizability.
     const labelMap = {
       compare: '?', ton: 'TON', tof: 'TOF', tp: 'TP',
-      ctu: 'CTU', ctd: 'CTD', move: '→', add: '+', sub: '−',
+      ctu: 'CTU', ctd: 'CTD', ctud: 'CUD', r_trig: 'R', f_trig: 'F', move: '→', add: '+', sub: '−',
       mul: '×', div: '÷', fb_and: '&', fb_or: '≥1', fb_xor: '=1',
       fb_not: '!', assign: '=',
+      tcon: 'CON', tdiscon: 'DIS', tsend: 'SND', trcv: 'RCV',
     };
     const label = labelMap[kind] || (def && def.name ? def.name.charAt(0) : '▭');
     return T.svg('svg', attrs, [
@@ -317,7 +318,62 @@
     .tia-scl-ref code { background:var(--tia-panel, #eef3f7); padding:0 3px; border-radius:3px;
       font:12px ui-monospace, Consolas, monospace; }
   `);
+  // System FBs offered for SCL blocks: click inserts the call at the cursor,
+  // dragging drops it where you let go; either way the instance is declared.
+  const SCL_INSTR = [
+    ['Communication', [['TCON', 'Establish communication connection'], ['TDISCON', 'Terminate communication connection'],
+      ['TSEND', 'Send data via communication connection'], ['TRCV', 'Receive data via communication connection']]],
+    ['Timers', [['TON', 'Generate on-delay'], ['TOF', 'Generate off-delay'], ['TP', 'Generate pulse']]],
+    ['Counters', [['CTU', 'Count up'], ['CTD', 'Count down'], ['CTUD', 'Count up and down']]],
+    ['Edge detection', [['R_TRIG', 'Detect rising edge'], ['F_TRIG', 'Detect falling edge']]],
+  ];
+  function sclInstructions(host) {
+    const list = T.el('div', { class: 'tia-ins-list', style: { flex: '0 0 auto', overflow: 'visible' } });
+    SCL_INSTR.forEach(([group, items]) => {
+      if (!(group in expanded)) expanded[group] = true;
+      const twisty = T.el('span', { class: 'tia-ins-twisty' + (expanded[group] ? ' open' : ''), html: T.icons.chevron });
+      const childWrap = T.el('div', { class: 'tia-ins-group-items', style: { display: expanded[group] ? '' : 'none' } });
+      items.forEach(([name, text]) => {
+        childWrap.appendChild(T.el('div', {
+          class: 'tia-ins-item', title: name + ' — ' + text + ' (click: insert at the cursor, or drag into the code)',
+          draggable: true,
+          ondragstart: (e) => {
+            const ed = T.activeEditor;
+            const code = ed && ed.dragPlan ? ed.dragPlan(name) : '';
+            if (!code) { e.preventDefault(); return; }
+            e.dataTransfer.setData('text/plain', code);
+            e.dataTransfer.setData('text/tia-sysfb', name);
+            e.dataTransfer.effectAllowed = 'copy';
+          },
+          ondragend: () => { if (T.activeEditor && T.activeEditor.dragEnd) T.activeEditor.dragEnd(); },
+          onclick: () => {
+            if (T.activeEditor && T.activeEditor.insertSysCall) T.activeEditor.insertSysCall(name);
+            else T.status('Open an SCL block to insert ' + name, 'warn');
+          },
+        },
+          T.el('span', { class: 'tia-ins-glyph' }, glyphFor(name.toLowerCase(), { name })),
+          T.el('span', { class: 'tia-ins-name' }, name + ' — ' + text),
+          T.el('span', { class: 'tia-ins-kind' }, 'FB')));
+      });
+      list.appendChild(T.el('div', { class: 'tia-ins-group' },
+        T.el('div', {
+          class: 'tia-ins-group-head',
+          onclick: () => {
+            expanded[group] = !expanded[group];
+            twisty.classList.toggle('open', expanded[group]);
+            childWrap.style.display = expanded[group] ? '' : 'none';
+          },
+        }, twisty, T.el('span', {}, group), T.el('span', { class: 'tia-ins-group-count' }, '(' + items.length + ')')),
+        childWrap));
+    });
+    host.appendChild(list);
+  }
+
   function renderSclReference(host) {
+    const scroll = T.el('div', { style: { height: '100%', overflow: 'auto' } });
+    host.appendChild(scroll);
+    sclInstructions(scroll);
+    host = scroll;
     const ref = T.el('div', { class: 'tia-scl-ref' });
     const h = (t) => ref.appendChild(T.el('h4', {}, t));
     const pre = (t) => ref.appendChild(T.el('pre', {}, t));

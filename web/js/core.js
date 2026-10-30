@@ -117,6 +117,9 @@ window.TIA = window.TIA || {};
    *   dataType  : default operand data type ('Bool' for contacts/coils)
    *   defParams : default `params` object for the element
    *   pins      : FBD pin layout { in:[names], out:[names] }
+   *   pinParams : pin name -> params key, for boxes whose pins (other than
+   *               the first, power-driven one) are operands kept in params
+   *               { in:{PIN:key}, out:{PIN:key} } (Communication)
    *   expand    : 'in' if number of inputs can grow (AND/OR/XOR/ADD...)
    * ======================================================================*/
   T.catalog = {
@@ -196,6 +199,28 @@ window.TIA = window.TIA || {};
     scale_x: { name: 'SCALE_X — Scale', group: 'Conversion', area: 'output', box: true,
                defParams: { min: '0', val: '0', max: '1', out: '', eno: '' }, pins: { in: ['MIN', 'VALUE', 'MAX'], out: ['OUT', 'ENO'] } },
 
+    /* ---- Communication: Open User Communication over TCP (sysfb.js). REQ /
+       EN_R is the first pin (the rung power in LAD); CONNECT names the
+       TCON_IP_v4 parameter block, DATA the send / receive area (a DB or member
+       path, a whole DB, or a tag). Each box keeps its own instance. ---- */
+    tcon: { name: 'TCON — Establish communication connection', group: 'Communication', area: 'output', box: true,
+            defParams: { id: '1', connect: '', done: '', busy: '', error: '', status: '' },
+            pins: { in: ['REQ', 'ID', 'CONNECT'], out: ['DONE', 'BUSY', 'ERROR', 'STATUS'] },
+            pinParams: { in: { ID: 'id', CONNECT: 'connect' }, out: { DONE: 'done', BUSY: 'busy', ERROR: 'error', STATUS: 'status' } } },
+    tdiscon: { name: 'TDISCON — Terminate communication connection', group: 'Communication', area: 'output', box: true,
+               defParams: { id: '1', done: '', busy: '', error: '', status: '' },
+               pins: { in: ['REQ', 'ID'], out: ['DONE', 'BUSY', 'ERROR', 'STATUS'] },
+               pinParams: { in: { ID: 'id' }, out: { DONE: 'done', BUSY: 'busy', ERROR: 'error', STATUS: 'status' } } },
+    tsend: { name: 'TSEND — Send data via communication connection', group: 'Communication', area: 'output', box: true,
+             defParams: { id: '1', len: '0', data: '', done: '', busy: '', error: '', status: '' },
+             pins: { in: ['REQ', 'ID', 'LEN', 'DATA'], out: ['DONE', 'BUSY', 'ERROR', 'STATUS'] },
+             pinParams: { in: { ID: 'id', LEN: 'len', DATA: 'data' }, out: { DONE: 'done', BUSY: 'busy', ERROR: 'error', STATUS: 'status' } } },
+    trcv: { name: 'TRCV — Receive data via communication connection', group: 'Communication', area: 'output', box: true,
+            defParams: { id: '1', len: '0', data: '', ndr: '', busy: '', error: '', status: '', rcvd_len: '' },
+            pins: { in: ['EN_R', 'ID', 'LEN', 'DATA'], out: ['NDR', 'BUSY', 'ERROR', 'STATUS', 'RCVD_LEN'] },
+            pinParams: { in: { ID: 'id', LEN: 'len', DATA: 'data' },
+                         out: { NDR: 'ndr', BUSY: 'busy', ERROR: 'error', STATUS: 'status', RCVD_LEN: 'rcvd_len' } } },
+
     /* ---- Block call (created by dragging a block from the project tree onto a
        network; NOT shown in the instruction tree because group 'Calls' is not in
        T.catalogGroups). params.target holds the called block's id. ---- */
@@ -204,7 +229,14 @@ window.TIA = window.TIA || {};
   };
 
   // Ordered groups for the instruction tree.
-  T.catalogGroups = ['Bit logic', 'Comparator', 'Timers', 'Counters', 'Move operations', 'Math functions', 'Conversion'];
+  T.catalogGroups = ['Bit logic', 'Comparator', 'Timers', 'Counters', 'Move operations', 'Math functions', 'Conversion',
+    'Communication'];
+  // pin -> params key of a catalog box ({} when the kind has none): editors use it
+  // for the operand labels, sim.js for the unwired numeric pins
+  T.pinParams = function (kind, dir) {
+    const d = T.catalog[kind];
+    return (d && d.pinParams && d.pinParams[dir]) || {};
+  };
   T.catalogFor = function (lang) {
     // returns array of {kind, def} available in the given language ('LAD'|'FBD').
     // SCL (and any non-graphical language) has no drag-and-drop instructions.

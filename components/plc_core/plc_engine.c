@@ -685,10 +685,9 @@ blk_t *plc_find_block_name(plc_t *p, const char *name)
     return NULL;
 }
 
-/* "#rec.flag", "Data".values[3], MyDb.a.b: types.js T.resolvePath. Returns 1
- * with an elementary cell in r, 2 for a structured value (no cell), 0 when
- * the path names nothing (the caller carries on with tags / symbols). */
-static int resolve_path(plc_t *p, const members_t *mem, const char *raw, ref_t *r)
+/* "#rec.flag", "Data".values[3], MyDb.a.b: types.js T.resolvePath — the
+ * type of the value it names (NULL: nothing), its bytes in *ptr / *bitp */
+static const ty_t *path_locate(plc_t *p, const members_t *mem, const char *raw, uint8_t **ptr, uint8_t *bitp)
 {
     const char *s = raw;
     bool local = false;
@@ -698,13 +697,13 @@ static int resolve_path(plc_t *p, const members_t *mem, const char *raw, ref_t *
     const char *rest;
     if (*s == '"') {
         const char *e = strchr(s + 1, '"');
-        if (!e || e == s + 1) return 0;
+        if (!e || e == s + 1) return NULL;
         size_t n = (size_t)(e - s - 1) < sizeof first - 1 ? (size_t)(e - s - 1) : sizeof first - 1;
         memcpy(first, s + 1, n);
         first[n] = 0;
         rest = e + 1;
     } else {
-        if (!(isalpha((unsigned char)*s) || *s == '_')) return 0;
+        if (!(isalpha((unsigned char)*s) || *s == '_')) return NULL;
         const char *e = s;
         while (isalnum((unsigned char)*e) || *e == '_') e++;
         size_t n = (size_t)(e - s) < sizeof first - 1 ? (size_t)(e - s) : sizeof first - 1;
@@ -719,30 +718,42 @@ static int resolve_path(plc_t *p, const members_t *mem, const char *raw, ref_t *
         const fld_t *f = ty_field(mem->t, first);
         if (f && !f->ref) {
             lt = ty_locate(mem->t, s, &off, &bit);
-            if (!lt) return 0;
-            if (lt->k != TK_EL) return 2;
-            r->c = plc_loc_cell(p, mem->m->buf + off, bit, lt, NULL);
-            r->bit = lt->cls == TC_BOOL;
-            return 1;
+            if (!lt) return NULL;
+            *ptr = mem->m->buf + off;
+            *bitp = bit;
+            return lt;
         }
-        if (f) return 0; /* reference parameters: SCL only */
+        if (f) return NULL; /* reference parameters: SCL only */
     }
     const char *q = rest;
     while (isws(*q)) q++;
-    if (local || !*q) return 0;
+    if (local || !*q) return NULL;
     blk_t *db = NULL;
     for (size_t i = 0; i < p->nblocks; i++)
         if (p->blocks[i].type == BT_DB && ieq(p->blocks[i].name, first)) {
             db = &p->blocks[i];
             break;
         }
-    if (!db) return 0;
+    if (!db) return NULL;
     mem_t *m = plc_db_mem(p, db);
-    if (!m) return 0;
+    if (!m) return NULL;
     lt = ty_locate(m->t, rest, &off, &bit);
+    if (!lt) return NULL;
+    *ptr = m->buf + off;
+    *bitp = bit;
+    return lt;
+}
+
+/* an operand path as a cell: 1 with an elementary cell in r, 2 for a
+ * structured value (no cell), 0 when the path names nothing (the caller
+ * carries on with tags / symbols) */
+static int resolve_path(plc_t *p, const members_t *mem, const char *raw, ref_t *r)
+{
+    uint8_t *ptr, bit;
+    const ty_t *lt = path_locate(p, mem, raw, &ptr, &bit);
     if (!lt) return 0;
     if (lt->k != TK_EL) return 2;
-    r->c = plc_loc_cell(p, m->buf + off, bit, lt, NULL);
+    r->c = plc_loc_cell(p, ptr, bit, lt, NULL);
     r->bit = lt->cls == TC_BOOL;
     return 1;
 }
@@ -918,6 +929,7 @@ static const struct {
     {"assign", K_ASSIGN}, {"compare", K_COMPARE}, {"ton", K_TON}, {"tof", K_TOF}, {"tp", K_TP},
     {"ctu", K_CTU}, {"ctd", K_CTD}, {"ctud", K_CTUD}, {"move", K_MOVE}, {"add", K_ADD}, {"sub", K_SUB},
     {"mul", K_MUL}, {"div", K_DIV}, {"norm_x", K_NORM_X}, {"scale_x", K_SCALE_X}, {"call", K_CALL},
+    {"tcon", K_TCON}, {"tdiscon", K_TDISCON}, {"tsend", K_TSEND}, {"trcv", K_TRCV},
 };
 
 static uint8_t kind_of(const char *s)
@@ -937,6 +949,7 @@ static const char *const KP_CMP[] = {"in1", "in2", NULL};
 static const char *const KP_SR[] = {"r", NULL};
 static const char *const KP_RS[] = {"s", NULL};
 static const char *const KP_TRIG[] = {"q", NULL};
+static const char *const KP_COMM[] = {"id", "len", "done", "busy", "error", "status", "ndr", "rcvd_len", NULL};
 
 static const char *const *kparams(uint8_t k)
 {
@@ -951,9 +964,12 @@ static const char *const *kparams(uint8_t k)
     case K_SR: return KP_SR;
     case K_RS: return KP_RS;
     case K_P_TRIG: case K_N_TRIG: case K_R_TRIG: case K_F_TRIG: return KP_TRIG;
+    case K_TCON: case K_TDISCON: case K_TSEND: case K_TRCV: return KP_COMM;
     default: return NULL;
     }
 }
+
+static bool is_comm(uint8_t k) { return k >= K_TCON && k <= K_TRCV; }
 
 static bool is_timer(uint8_t k) { return k == K_TON || k == K_TOF || k == K_TP; }
 
@@ -998,6 +1014,10 @@ static const char *in_param_key(uint8_t k, const char *pin)
         if (!strcmp(pin, "VALUE")) return "val";
         if (!strcmp(pin, "MAX")) return "max";
         return NULL;
+    case K_TCON: case K_TDISCON: case K_TSEND: case K_TRCV:
+        if (!strcmp(pin, "ID")) return "id";
+        if (!strcmp(pin, "LEN")) return "len";
+        return NULL;
     default: return NULL;
     }
 }
@@ -1027,6 +1047,10 @@ static int sem_inputs(uint8_t k, sem_t out[3])
     case K_TON: case K_TOF: case K_TP: out[0] = (sem_t){"PT", "pt", TM_PT}; return 1;
     case K_CTU: case K_CTD: case K_CTUD: out[0] = (sem_t){"PV", "pv", CT_PV}; return 1;
     case K_MOVE: out[0] = (sem_t){"IN", "in", MV_IN}; return 1;
+    case K_TCON: case K_TDISCON: case K_TSEND: case K_TRCV:
+        out[0] = (sem_t){"ID", "id", CM_ID};
+        out[1] = (sem_t){"LEN", "len", CM_LEN};
+        return 2;
     default: return 0;
     }
 }
@@ -1456,6 +1480,63 @@ static call_t *compile_call(plc_t *p, unit_t *u, int el, const char *elid, bool 
     return c;
 }
 
+/* CONNECT / DATA of an OUC box: sim.js commRef — a member / DB path, a whole
+ * DB, or a tag (its cell); unbound when it names nothing */
+static vref_t comm_ref(plc_t *p, unit_t *u, const char *raw)
+{
+    vref_t r;
+    memset(&r, 0, sizeof r);
+    char s[192];
+    trim_copy(raw, s, sizeof s);
+    if (!*s) return r;
+    uint8_t *ptr, bit;
+    const ty_t *lt = path_locate(p, &u->mem, s, &ptr, &bit);
+    if (lt) {
+        r.ptr = ptr;
+        r.bit = bit;
+        r.t = lt;
+        return r;
+    }
+    if (*s == '#') return r;
+    char *name = s;
+    size_t sl = strlen(s);
+    if (sl >= 2 && s[0] == '"' && s[sl - 1] == '"' && !memchr(s + 1, '"', sl - 2)) s[sl - 1] = 0, name = s + 1;
+    for (size_t i = 0; i < p->nblocks; i++)
+        if (p->blocks[i].type == BT_DB && ieq(p->blocks[i].name, name)) {
+            mem_t *m = plc_db_mem(p, &p->blocks[i]);
+            if (m) r.ptr = m->buf, r.t = m->t;
+            return r;
+        }
+    int ti = plc_tag_index(p, name);
+    if (ti >= 0) {
+        const ty_t *t = ty_parse(p, *p->tags[ti].dtype ? p->tags[ti].dtype : "Int", -1, NULL, 0);
+        r.is_cell = 1;
+        r.cell = p->tags[ti].c;
+        r.cbit = p->tags[ti].is_bool;
+        r.t = t && t->k == TK_EL ? t : &TY_LREAL;
+    }
+    return r;
+}
+
+static ouc_box_t *comm_box(plc_t *p, unit_t *u, uint8_t kind, int params)
+{
+    static const char *const FB[] = {"TCON", "TDISCON", "TSEND", "TRCV"};
+    const ty_t *t = plc_sysfb_type(p, FB[kind - K_TCON]);
+    if (!t) return NULL;
+    ouc_box_t *b = (ouc_box_t *)plc_ar_alloc(p, sizeof(ouc_box_t));
+    b->t = t;
+    b->inst = (uint8_t *)plc_ar_alloc(p, t->size ? t->size : 1);
+    b->refs = (vref_t *)plc_ar_alloc(p, sizeof(vref_t) * (t->nf ? t->nf : 1));
+    char key[16], buf[192];
+    for (uint16_t i = 0; i < t->nf; i++) {
+        if (!t->f[i].ref) continue;
+        to_lower(t->f[i].name, key, sizeof key);
+        jget_str(p, params, key, buf, sizeof buf);
+        b->refs[i] = comm_ref(p, u, buf);
+    }
+    return b;
+}
+
 /* compile a LAD element or an FBD box (pins are wired later for FBD) */
 static node_t *compile_node(plc_t *p, unit_t *u, int el, bool fbd, char ***in_names_out)
 {
@@ -1493,6 +1574,7 @@ static node_t *compile_node(plc_t *p, unit_t *u, int el, bool fbd, char ***in_na
         jget_str(p, params, "op", buf, sizeof buf);
         n->cmp = cmp_of(buf);
     }
+    if (is_comm(n->kind)) n->ouc = comm_box(p, u, n->kind, params);
 
     char **in_names = NULL;
     if (fbd) {
@@ -1532,6 +1614,16 @@ static node_t *compile_node(plc_t *p, unit_t *u, int el, bool fbd, char ***in_na
                 }
     }
 
+    if (fbd && n->ouc) {
+        int ouc = jarr(p, el, "outputs");
+        uint32_t i = 0;
+        for (int po = jd_first(D, ouc); po >= 0 && i < n->nout; po = jd_next(D, po), i++) {
+            jget_str(p, po, "name", buf, sizeof buf);
+            n->out[i].cm = -1;
+            for (uint16_t f = 0; f < n->ouc->t->nf; f++)
+                if (n->ouc->t->f[f].sec == SEC_OUT && !strcmp(n->ouc->t->f[f].name, buf)) n->out[i].cm = (int16_t)f;
+        }
+    }
     if (n->kind == K_CALL) {
         n->call = compile_call(p, u, el, elid, fbd, in_names, n->nin);
         if (fbd && n->call) {
@@ -2312,6 +2404,35 @@ static bool rung_power(plc_t *p, net_t *net)
     return rung;
 }
 
+/* sim.js evalComm: one call of the box's system FB; the outputs go to their
+ * operands. Returns DONE (TRCV: NDR). */
+static bool comm_run(plc_t *p, node_t *n, bool req, double id, double len)
+{
+    ouc_box_t *b = n->ouc;
+    if (!b) return false;
+    const ty_t *t = b->t;
+    const fld_t *f = ty_field(t, n->kind == K_TRCV ? "EN_R" : "REQ");
+    ty_write(b->inst + f->off, f->bit, f->t, req ? 1 : 0);
+    f = ty_field(t, "ID");
+    ty_write(b->inst + f->off, f->bit, f->t, ty_conv(id, f->t));
+    if ((f = ty_field(t, "LEN")) != NULL) ty_write(b->inst + f->off, f->bit, f->t, ty_conv(len, f->t));
+    plc_sysfb_exec(p, t, b->inst, b->refs);
+    static const struct {
+        const char *name;
+        uint8_t slot;
+    } OUT[] = {{"DONE", CM_DONE}, {"NDR", CM_NDR}, {"BUSY", CM_BUSY}, {"ERROR", CM_ERROR}, {"STATUS", CM_STATUS},
+               {"RCVD_LEN", CM_RCVD}};
+    bool q = false;
+    for (size_t i = 0; i < sizeof OUT / sizeof OUT[0]; i++) {
+        if (!(f = ty_field(t, OUT[i].name))) continue;
+        double v = ty_read(b->inst + f->off, f->bit, f->t);
+        if (f->t->cls == TC_BOOL) wrb(p, n->par[OUT[i].slot], v != 0);
+        else wrn(p, n->par[OUT[i].slot], v);
+        if (OUT[i].slot == (n->kind == K_TRCV ? CM_NDR : CM_DONE)) q = v != 0;
+    }
+    return q;
+}
+
 static void apply_output(plc_t *p, node_t *n, bool pw)
 {
     cref_t *par = n->par;
@@ -2327,6 +2448,9 @@ static void apply_output(plc_t *p, node_t *n, bool pw)
         if (pw) wrb(p, n->op, false);
         break;
     case K_TON: case K_TOF: case K_TP: run_timer(p, n, pw, fmax(0, rdn(p, par[TM_PT]))); break;
+    case K_TCON: case K_TDISCON: case K_TSEND: case K_TRCV:
+        comm_run(p, n, pw, rdn(p, par[CM_ID]), rdn(p, par[CM_LEN]));
+        break;
     case K_CTU: run_ctu(p, n, pw, rdb(p, par[CT_R]), rdn(p, par[CT_PV])); break;
     case K_CTD: run_ctd(p, n, pw, rdb(p, par[CT_R]), rdn(p, par[CT_PV])); break;
     case K_CTUD: {
@@ -2596,6 +2720,12 @@ static void eval_box(plc_t *p, node_t *n)
         live = en;
         break;
     }
+    case K_TCON: case K_TDISCON: case K_TSEND: case K_TRCV: {
+        bool q = comm_run(p, n, ni > 0 && truthy(iv[0]), sem_val(p, n, 0, CM_ID), sem_val(p, n, 1, CM_LEN));
+        out = pvb(q);
+        live = q;
+        break;
+    }
     default:
         out = ni ? iv[0] : pvb(false);
         live = truthy(out);
@@ -2610,6 +2740,11 @@ static void eval_box(plc_t *p, node_t *n)
         else if (has_eno && o->pn == PN_ENO) v = m_eno;
         else if (is_timer(n->kind)) v = o->pn == PN_ET ? pvn(et_v) : out;
         else if (n->kind == K_CTU || n->kind == K_CTD) v = o->pn == PN_CV ? pvn(cv_v) : out;
+        else if (n->ouc && o->cm >= 0) {
+            const fld_t *f = &n->ouc->t->f[o->cm];
+            double x = ty_read(n->ouc->inst + f->off, f->bit, f->t);
+            v = f->t->cls == TC_BOOL ? pvb(x != 0) : pvn(x);
+        }
         else if (n->kind == K_CALL) {
             if (o->pn == PN_ENO) v = out;
             else if (o->cm >= 0 && n->call && o->cm < n->call->nout) {

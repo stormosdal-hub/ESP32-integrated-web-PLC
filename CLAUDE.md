@@ -139,6 +139,13 @@ with `T.model.*` so shapes match the editors). Cases are regenerated on every ru
   `s_xlock` — never do I2C inside the scan. Register protocols in `main/i2c_dev.c` (no IDF
   includes), checked against simulated chips by `test/host/test_i2c_dev.c` (run_parity).
   A module that stops answering reads 0 and is re-initialised every 0.5 s.
+- OUC boxes in LAD/FBD (`tcon`, `tdiscon`, `tsend`, `trcv` in `T.catalog`, group
+  *Communication*): the first pin is the power / REQ, the other pins map to `params`
+  through the catalog's `pinParams` (editors use `T.pinParams()`); each box runs the
+  system FB on an instance buffer of its own (sim.js `evalComm` per instance+element,
+  C `node->ouc`, refs for CONNECT / DATA resolved by `commRef` / `comm_ref`: member or
+  DB path, whole DB, tag). The SCL instruction pane inserts system FB calls and
+  declares the instance (`scl.js` `sysCallPlan`).
 - OUC: the `plc_net_t` callbacks run inside the scan with the runtime lock held —
   memory only (`ouc_net` copies into per-connection buffers under its own mutex); every
   socket call is in `ouc_net_poll()` on its own task. Without a driver the engine uses

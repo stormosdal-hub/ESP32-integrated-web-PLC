@@ -175,6 +175,7 @@ enum {
     K_MOVE, K_ADD, K_SUB, K_MUL, K_DIV,
     K_NORM_X, K_SCALE_X,
     K_CALL,
+    K_TCON, K_TDISCON, K_TSEND, K_TRCV,
     K__COUNT
 };
 
@@ -187,6 +188,7 @@ enum { SC_MIN = 0, SC_VAL, SC_MAX, SC_OUT, SC_ENO };              /* norm_x scal
 enum { CP_IN1 = 0, CP_IN2 };                                      /* compare */
 enum { LT_X = 0 };                                                /* sr: r / rs: s */
 enum { TG_Q = 0 };                                                /* *_trig */
+enum { CM_ID = 0, CM_LEN, CM_DONE, CM_BUSY, CM_ERROR, CM_STATUS, CM_NDR, CM_RCVD };  /* tcon .. trcv */
 
 enum { CMP_EQ = 0, CMP_NE, CMP_GT, CMP_LT, CMP_GE, CMP_LE, CMP_BAD };
 
@@ -231,6 +233,13 @@ typedef struct {
     pv_t *tmp;          /* LAD: sampled arguments (a call site never re-enters itself) */
 } call_t;
 
+/* an OUC box (TCON / TDISCON / TSEND / TRCV): the system FB's own instance */
+typedef struct {
+    const ty_t *t;              /* the system FB */
+    uint8_t *inst;
+    vref_t *refs;               /* per field: CONNECT / DATA (resolved at compile time) */
+} ouc_box_t;
+
 typedef struct node {
     uint8_t kind, cmp;
     uint8_t nin, nout;
@@ -243,6 +252,7 @@ typedef struct node {
     fout_t *out;
     pv_t *iv;           /* FBD scratch: input values */
     call_t *call;
+    ouc_box_t *ouc;
 } node_t;
 
 typedef struct {

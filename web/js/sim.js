@@ -257,6 +257,12 @@
         break;
       }
 
+      /* ---- Open User Communication (REQ / EN_R = rung power) ---- */
+      case 'tcon': case 'tdiscon': case 'tsend': case 'trcv':
+        evalComm(k, el.id, p, par, null);
+        el._live = p;
+        break;
+
       /* ---- block call ---- */
       case 'call':
         // EN = rung power. When enabled, execute the target block, copying the
@@ -454,6 +460,66 @@
     return { qu, qd, cv: s.count };
   }
 
+  /* ----- Open User Communication boxes (TCON / TDISCON / TSEND / TRCV) -----
+   * The system FB (sysfb.js) runs on an instance buffer of its own per
+   * (executing instance, box), like the timers' state. ID / LEN are numbers
+   * (FBD: the wired pin values in ext); CONNECT / DATA name what the job
+   * works on: a member / DB path, a whole DB, or a tag (commRef). The outputs
+   * go to their operands (params) and, in FBD, to the output pins. */
+  const COMM_FB = { tcon: 'TCON', tdiscon: 'TDISCON', tsend: 'TSEND', trcv: 'TRCV' };
+  const COMM_OUT = ['DONE', 'NDR', 'BUSY', 'ERROR', 'STATUS', 'RCVD_LEN'];
+  const lc = (x) => String(x || '').toLowerCase();
+  function commRef(raw) {
+    const s = raw == null ? '' : String(raw).trim();
+    if (!s) return null;
+    const L = T.resolvePath(s);
+    if (L) {
+      const d = T.mem.dbs[L.db];
+      return d ? { buf: d.buf, off: L.off, bit: L.bit, t: L.t } : null;
+    }
+    if (s[0] === '#') return null;
+    const name = /^"[^"]*"$/.test(s) ? s.slice(1, -1) : s;
+    const db = (T.project.blocks || []).find((b) => b && b.type === 'DB' && lc(b.name) === lc(name));
+    if (db) {
+      let d = null;
+      try { d = T.inst.db(db); } catch (e) { return null; }
+      return { buf: d.buf, off: 0, bit: 0, t: d.t };
+    }
+    const tag = T.tagByName(name) || (T.project.tags || []).find((t) => t.name && lc(t.name) === lc(name));
+    if (tag) {
+      let t;
+      try { t = T.types.parse(tag.dataType || 'Int'); } catch (e) { t = null; }
+      if (!t || t.k !== 'el') t = T.types.EL.LREAL;
+      const r = T.resolve(tag.name, tag.dataType === 'Bool' ? 'bit' : 'word');
+      return { cell: r.addr, bit: r.type === 'bit', t };
+    }
+    return null;
+  }
+  function evalComm(k, id, req, par, ext) {
+    const TY = T.types, def = TY.SYSFB[COMM_FB[k]], f = def.t.map;
+    const s = inst(id);
+    if (!s.ouc) s.ouc = new Uint8Array(def.t.size);
+    const buf = s.ouc;
+    const w = (n, v) => { const x = f[n]; TY.write(buf, x.off, x.bit, x.t, TY.conv(v, x.t)); };
+    w(k === 'trcv' ? 'en_r' : 'req', !!req);
+    w('id', ext ? ext.id : num(T.readNum(par.id)));
+    if (f.len) w('len', ext ? ext.len : num(T.readNum(par.len)));
+    const refs = {};
+    if (f.connect) refs.connect = commRef(par.connect);
+    if (f.data) refs.data = commRef(par.data);
+    T.sysfb.exec(def, buf, 0, refs);
+    const out = {};
+    COMM_OUT.forEach((n) => {
+      const x = f[n.toLowerCase()];
+      if (!x) return;
+      const v = TY.read(buf, x.off, x.bit, x.t);
+      out[n] = v;
+      const op = par[n.toLowerCase()];
+      if (notEmpty(op)) { if (x.t.cls === 'bool') T.writeBit(op, v); else T.writeNum(op, v); }
+    });
+    return { q: !!(k === 'trcv' ? out.NDR : out.DONE), out };
+  }
+
   // Evaluate one LAD network: compute rung power, drive each output.
   function evalLadNetwork(net) {
     const p = rungPower(net);
@@ -482,6 +548,10 @@
         if (pinName === 'MIN') return 'min';
         if (pinName === 'VALUE') return 'val';
         if (pinName === 'MAX') return 'max';
+        break;
+      case 'tcon': case 'tdiscon': case 'tsend': case 'trcv':
+        if (pinName === 'ID') return 'id';
+        if (pinName === 'LEN') return 'len';
         break;
     }
     return null;
@@ -709,6 +779,18 @@
         outVal = r;
         outMap = { ENO: eno };
         live = true;
+        break;
+      }
+
+      case 'tcon': case 'tdiscon': case 'tsend': case 'trcv': {
+        // REQ / EN_R = first input pin; ID / LEN wired or from params
+        const r = evalComm(k, box.id, !!inVals[0], par, {
+          id: num(unwiredNum(net, box, 'id', inVals, ins, 'ID')),
+          len: num(unwiredNum(net, box, 'len', inVals, ins, 'LEN')),
+        });
+        outVal = r.q;
+        outMap = r.out;
+        live = r.q;
         break;
       }
 
